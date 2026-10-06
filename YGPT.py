@@ -14,6 +14,7 @@ from config import *
 from code_chunker import CodeChunker, RepositoryData
 from embedder_and_retriever import Embedder, Retriever
 from context_builder import *
+from code_reviewer import review_chunks
 
 # Set the model now (will be loaded at a later stage)
 LOCAL_MODEL = None
@@ -117,7 +118,7 @@ def parse_paths(command_arguments: str) -> tuple[Path, Path | None] | Exception:
     return target_path, markdown_path
 
 # performs code review on a source file
-def review_source_file(target_path:Path) -> None:
+def review_source_file(target_path:Path, markdown_path: Path | None = None) -> None:
     # initialise repository data
     repository_data = RepositoryData([], [])
     # parse file and get bytes
@@ -142,28 +143,20 @@ def review_source_file(target_path:Path) -> None:
     chunker.chunk(parse_tree.root_node)
     # get data from repository
     repository_data = chunker.repository_data
-    print(f"Successfully chunked {len(repository_data)} chunks within {target_path}.")
+    print(f"Successfully chunked {len(repository_data.chunks)} chunks within {target_path}.")
     # nothing to embed (e.g. an empty file or one with no named functions/classes)
     if not repository_data.chunks:
         print(f"No code chunks were found in {target_path}, so there is nothing to review.")
         return
-    # build context using all chunks from the source file
-    context = build_context(repository_data.chunks)
-    # build prompt using the code review instruction and context
-    prompt = build_review_prompt(context)
-    # now try and retrieve information from LLM
-    try: 
-        # run llm query
-        if LOCAL_MODEL is None:
-            raise Exception("Error: local model uninitialised.")
-        ran = LOCAL_MODEL.run_query_through_model(prompt)    
-        # check if we ran
-        if ran is False:
-            raise Exception("Failed to run local model.")
+    # we need the model before doing any expensive work
+    if LOCAL_MODEL is None:
+        print("Unable to run code review because of Error: local model uninitialised.")
+        return
+    # review the chunks (and write the markdown file if a path was given)
+    review_error = review_chunks(target_path, repository_data, LOCAL_MODEL, markdown_path)
     # Output any exceptions
-    except Exception as e:
-        print(f"Unable to run code review because of {e}")
-
+    if isinstance(review_error, Exception):
+        print(f"Unable to run code review because of {review_error}")
 
 # runs a code review
 def run_review(input_str: str) -> None:
@@ -186,7 +179,7 @@ def run_review(input_str: str) -> None:
     # Determine whether the target is a file or repository
     if target_path.is_file():
         # conduct code review on single file
-        review_source_file(target_path)
+        review_source_file(target_path, markdown_path)
 
     elif target_path.is_dir():
         print("Target is a repository.")
