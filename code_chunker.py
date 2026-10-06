@@ -11,6 +11,8 @@ from tree_sitter import Language, Node, Tree
 from pathlib import Path
 # deque: used for walking parse tree
 from collections import deque
+# bisect_right: used to turn byte offsets into line numbers
+from bisect import bisect_right
 
 # set enums for code module types
 class SymbolType(Enum):
@@ -114,6 +116,9 @@ class CodeChunker:
         self.set_language_features()
         # track number of visited nodes
         self.nodes_visited = 0
+        # get the byte offset at which each line of the source starts (used to work out line numbers)
+        # note that we avoid node.start_point and node.end_point for this: reading them crashes Python (segfault) in tree-sitter 0.26.x
+        self.line_starts = [0] + [index + 1 for index, byte in enumerate(source) if byte == 10]
 
     # set language features
     def set_language_features(self):
@@ -137,47 +142,64 @@ class CodeChunker:
 
     # walk the parse Tree, identifying important features and adding those features as code chunks
     def walk_node(self, root_node: Node,parent_chunk_id: int|None) -> None:
-        # we walk the parse tree using BFS -> avoid issues with recursion
-        # and only focus on the nodes we need, making control flow predictable
-        # set up queue of nodes to visit and initialise it
-        nodes_to_visit: deque[tuple[Node, int | None]] = deque(
-            [(root_node, parent_chunk_id)]
-        )
-        # conduct breadth-first-search on parse Tree
-        while nodes_to_visit:
-            # get node and the id of its parent
-            node, current_parent_id = nodes_to_visit.popleft()
-            # check how many nodes visted
+        # we walk the parse tree depth-first using a cursor: this avoids recursion and avoids building a list of children
+        # for every node (which was slow on large files), and every node is visited exactly once
+        cursor = root_node.walk()
+        # parent_stack holds, for each level of the tree we are inside, the id of the chunk that contains that level
+        parent_stack: list[int | None] = [parent_chunk_id]
+        # a root node with no children has nothing to chunk
+        if not cursor.goto_first_child():
+            return
+        # visit every node beneath the root
+        while True:
+            # get the node under the cursor
+            node = cursor.node
+            # count the visited node
             self.nodes_visited += 1
-            print(f"visited nodes: {self.nodes_visited}")
-            # classify the direct children of the current node
-            for child in node.named_children:
-                # set current parent ID
-                child_parent_id = current_parent_id
+            # get the id of the chunk that contains this node (None at the top level)
+            current_parent_id = parent_stack[-1]
+            # nodes beneath this one belong to the same chunk, unless this node becomes a chunk itself
+            child_parent_id = current_parent_id
+            # only named nodes can become chunks
+            if node.is_named:
                 # check if we have discovered a node that should become a code chunk
-                discovered = self.discover_node(child, current_parent_id)
+                discovered = self.discover_node(node, current_parent_id)
                 if discovered is not None:
-                    # create new chunk and append it
+                    # create new chunk
                     chunk = self.create_chunk(discovered)
-                    # continue on empty chunk
-                    if chunk is None:
-                        continue
-                    self.repository_data.chunks.append(chunk)
-                    # check if we discovered a parent of the current chunk
-                    if discovered.parent_chunk_id is not None:
-                        # add the new relationship
-                        self.repository_data.relationships.append(
-                            Relationship(
-                                start_chunk_id=discovered.parent_chunk_id,
-                                end_chunk_id=chunk.chunk_id,
-                                relationship_type=RelationshipType.CONTAINS
+                    # a nameless node is not a chunk, but we still walk beneath it so that nothing inside it is lost
+                    if chunk is not None:
+                        # append the chunk
+                        self.repository_data.chunks.append(chunk)
+                        # check if we discovered a parent of the current chunk
+                        if current_parent_id is not None:
+                            # add the new relationship
+                            self.repository_data.relationships.append(
+                                Relationship(
+                                    start_chunk_id=current_parent_id,
+                                    end_chunk_id=chunk.chunk_id,
+                                    relationship_type=RelationshipType.CONTAINS
+                                )
                             )
-                        )
-                    # reset child parent ID so that any declarations discovered beneath this node belong to the new chunk
-                    child_parent_id = chunk.chunk_id
-                # check the node type and add declaration-containing nodes to the queue
-                if child.type in self.declaration_containers:
-                    nodes_to_visit.append((child, child_parent_id))
+                        # declarations discovered beneath this node belong to the new chunk
+                        child_parent_id = chunk.chunk_id
+            # walk into the children of the node: wrapper nodes (declaration lists, blocks, template declarations)
+            # must be walked through to reach the declarations inside them
+            if cursor.goto_first_child():
+                # remember which chunk contains the children
+                parent_stack.append(child_parent_id)
+                # visit the first child
+                continue
+            # the node has no children: move to the next sibling, climbing back up the tree when there are no more siblings
+            while not cursor.goto_next_sibling():
+                # climb to the parent: if there is none then the whole tree has been visited
+                if not cursor.goto_parent():
+                    return
+                # leave this level of the tree
+                parent_stack.pop()
+                # once we are back at the root there is nothing left to visit
+                if not parent_stack:
+                    return
 
     # classify node and add its discovered variant
     def discover_node(self, node: Node, parent_chunk_id: int | None) -> DiscoveredNode | None:
@@ -212,7 +234,7 @@ class CodeChunker:
         chunk_name = self.extract_name(node)
         if chunk_name is None:
             return None
-        # return discovered chunk
+        # return discovered chunk (line numbers come from byte offsets, see the note in __init__)
         return CodeChunk(
             chunk_id=chunk_id,
             chunk_name=chunk_name,
@@ -220,8 +242,8 @@ class CodeChunker:
             file_path=self.file_path,
             language=self.language_used,
             symbol_type=discovered.symbol_type,
-            start_line=node.start_point.row + 1,
-            end_line=node.end_point.row + 1
+            start_line=bisect_right(self.line_starts, node.start_byte),
+            end_line=bisect_right(self.line_starts, node.end_byte)
         )
 
     # get the name of the relevant chunk
