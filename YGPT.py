@@ -8,7 +8,7 @@ import shlex
 from enum import Enum
 
 # Imported internal dependencies
-from code_parser import get_language, parse_source_file, parse_repository
+from code_parser import get_language, parse_source_file, chunk_repository, ChunkedRepository
 from model import*
 from config import *
 from code_chunker import CodeChunker, RepositoryData
@@ -117,6 +117,22 @@ def parse_paths(command_arguments: str) -> tuple[Path, Path | None] | Exception:
     # return target/markdown paths
     return target_path, markdown_path
 
+# reviews chunked code with the model, once there is something to review (shared by the file and repository reviews)
+def review_chunked_code(target_path: Path, repository_data: RepositoryData, markdown_path: Path | None, chunked: ChunkedRepository | None = None) -> None:
+    # nothing to embed (e.g. an empty file or one with no named functions/classes)
+    if not repository_data.chunks:
+        print(f"No code chunks were found in {target_path}, so there is nothing to review.")
+        return
+    # we need the model before doing any expensive work
+    if LOCAL_MODEL is None:
+        print("Unable to run code review because of Error: local model uninitialised.")
+        return
+    # review the chunks (and write the markdown file if a path was given)
+    review_error = review_chunks(target_path, repository_data, LOCAL_MODEL, markdown_path, chunked)
+    # Output any exceptions
+    if isinstance(review_error, Exception):
+        print(f"Unable to run code review because of {review_error}")
+
 # performs code review on a source file
 def review_source_file(target_path:Path, markdown_path: Path | None = None) -> None:
     # initialise repository data
@@ -144,19 +160,24 @@ def review_source_file(target_path:Path, markdown_path: Path | None = None) -> N
     # get data from repository
     repository_data = chunker.repository_data
     print(f"Successfully chunked {len(repository_data.chunks)} chunks within {target_path}.")
-    # nothing to embed (e.g. an empty file or one with no named functions/classes)
-    if not repository_data.chunks:
-        print(f"No code chunks were found in {target_path}, so there is nothing to review.")
+    # review the chunks
+    review_chunked_code(target_path, repository_data, markdown_path)
+
+# performs code review on a whole repoitory, one file after another
+def review_repository(target_path:Path, markdown_path: Path | None = None) -> None:
+    print(f"Attempting to chunk and parse the code files in {target_path}.")
+    # chunk every code file in the repository (a file that can not be read is noted and skipped)
+    chunked = chunk_repository(target_path)
+    # check for errors -> return None if they are encountered
+    if isinstance(chunked, Exception):
+        print(chunked)
         return
-    # we need the model before doing any expensive work
-    if LOCAL_MODEL is None:
-        print("Unable to run code review because of Error: local model uninitialised.")
-        return
-    # review the chunks (and write the markdown file if a path was given)
-    review_error = review_chunks(target_path, repository_data, LOCAL_MODEL, markdown_path)
-    # Output any exceptions
-    if isinstance(review_error, Exception):
-        print(f"Unable to run code review because of {review_error}")
+    print(f"Successfully chunked {len(chunked.repository_data.chunks)} chunks within {chunked.file_count - len(chunked.skipped_files)} of {chunked.file_count} code files.")
+    # say which files could not be read
+    for skipped_file in chunked.skipped_files:
+        print(f"Skipped {skipped_file[2:]}")
+    # review the chunks, file by file
+    review_chunked_code(target_path, chunked.repository_data, markdown_path, chunked)
 
 # runs a code review
 def run_review(input_str: str) -> None:
@@ -182,7 +203,8 @@ def run_review(input_str: str) -> None:
         review_source_file(target_path, markdown_path)
 
     elif target_path.is_dir():
-        print("Target is a repository.")
+        # conduct code review on a whole repository
+        review_repository(target_path, markdown_path)
     else:
         print(f"Target path does not exist: {target_path}")
 
