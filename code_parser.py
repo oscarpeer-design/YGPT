@@ -9,8 +9,10 @@ from tree_sitter import Language, Parser, Tree, Node
 import tree_sitter_python
 import tree_sitter_cpp
 from collections import deque
+# dataclass annotation: used for data-class structs
+from dataclasses import dataclass
 
-from code_chunker import LANGUAGE_CPP, LANGUAGE_PYTHON
+from code_chunker import LANGUAGE_CPP, LANGUAGE_PYTHON, CodeChunker, RepositoryData
 
 # set up valid file endings
 VALID_FILE_ENDINGS = ['.cpp', '.hpp','.h', '.py']
@@ -170,37 +172,67 @@ def get_code_files(repository_path: Path) -> list[Path]:
 
     Postcondition:
         Returns a list containing only files whose extensions are present
-        in VALID_FILE_ENDINGS.
+        in VALID_FILE_ENDINGS, in a stable order (sorted by path).
 
     Purpose:
         Find all supported source-code files within a repository.
     """
 
-    code_files = []
+    code_files = set()
     # get list of code file paths that only have valid endings (global children of the respository path) by recursively scanning through this repository
     for file_ending in VALID_FILE_ENDINGS:
-        code_files.extend(repository_path.rglob(f"*{file_ending}"))
+        # only files count (a folder could be named like a code file)
+        code_files.update(path for path in repository_path.rglob(f"*{file_ending}") if path.is_file())
 
-    return code_files
+    # a stable order means that the same repository is always reviewed in the same order
+    return sorted(code_files)
 
-# parse a repository to find all relevant code files
-def parse_repository(repository_path: Path) -> dict[Path, Tree]|Exception:
+# The result of chunking a repository: the chunks of every code file that could be read, and the files that could not
+@dataclass
+class ChunkedRepository:
+    repository_data: RepositoryData # the chunks and relationships of all the files that could be chunked
+    file_count: int # how many code files were found
+    skipped_files: list[str] # one note for each file that could not be read or chunked, with the reason
+
+# chunk one code file into the shared repository data. Returns None, or an Exception if the file could not be read or chunked.
+def chunk_code_file(file_path: Path, repository_data: RepositoryData) -> None|Exception:
+    # parse the file and get its bytes
+    parsing_results = parse_source_file(file_path)
+    if isinstance(parsing_results, Exception):
+        return parsing_results
+    parse_tree, source_bytes = parsing_results
+    # remember how much data there was, so that a file that fails half way leaves nothing behind
+    chunk_count = len(repository_data.chunks)
+    relationship_count = len(repository_data.relationships)
+    try:
+        # the chunker adds the chunks of the file to the shared repository data
+        chunker = CodeChunker(
+            file_path=file_path,
+            source=source_bytes,
+            language_used=get_language(file_path),
+            repository_data=repository_data
+        )
+        chunker.chunk(parse_tree.root_node)
+    except Exception as e:
+        del repository_data.chunks[chunk_count:]
+        del repository_data.relationships[relationship_count:]
+        return Exception(f"Unable to chunk the file {file_path}. Error: {e}")
+
+# chunk every code file in a repository into one shared RepositoryData, one file at a time (a parse tree is dropped as soon as its file is chunked).
+# A file that can not be read or chunked is noted and the other files carry on. Returns an Exception only if there are no code files at all.
+def chunk_repository(repository_path: Path) -> ChunkedRepository|Exception:
     # get relevant code files
     code_files = get_code_files(repository_path)
-    # initialise dictionary of parse trees
-    parsed_files = {}
-    # read source code for each file
+    if not code_files:
+        return Exception(f"No code files were found in {repository_path}. Anticipated these file endings: {VALID_FILE_ENDINGS}.")
+    repository_data = RepositoryData([], [])
+    skipped_files: list[str] = []
     for file_path in code_files:
-        #source = file_path.read_text(encoding="utf-8")
-        # get parse tree of source
-        parse_tree, source_bytes = parse_source_file(file_path)
-        # check we have no error encountered
-        if isinstance(parse_tree, Exception):
-            return parse_tree
-        # add parsed output (each path signifies a unique code file)
-        parsed_files[file_path] = parse_tree
-    # return parsed output
-    return parsed_files
+        chunked = chunk_code_file(file_path, repository_data)
+        # note the file and carry on with the others
+        if isinstance(chunked, Exception):
+            skipped_files.append(f"- {chunked}")
+    return ChunkedRepository(repository_data, len(code_files), skipped_files)
 
 # get the language of a source file
 def get_language(source_file: Path) -> str:

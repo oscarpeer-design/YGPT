@@ -212,8 +212,8 @@ class Retriever:
             if index == chunk_index or index >= len(self.all_chunks):
                 continue
             candidate = self.all_chunks[index]
-            # skip chunks that share lines with the chunk
-            if candidate.start_line <= target.end_line and candidate.end_line >= target.start_line:
+            # skip chunks that share lines with the chunk (chunks of other files can not overlap it)
+            if candidate.file_path == target.file_path and candidate.start_line <= target.end_line and candidate.end_line >= target.start_line:
                 continue
             related.append(candidate)
             # stop when we have enough

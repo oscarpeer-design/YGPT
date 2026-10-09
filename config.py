@@ -76,6 +76,10 @@ REVIEW_RELATED_SIMILARITY_THRESHOLD = 0.40
 # Guideline for the total time (in seconds) a review spends waiting for the model. It is checked before each model call, so the last call may finish after it.
 # Reviews saved from an earlier run cost no time, so running the same review again carries on where it stopped
 REVIEW_TIME_BUDGET_SECONDS = 300
+# The same guideline for reviewing a whole repository. Files are reviewed one after another: each file gets the time that is left divided by the number of files still to do, so time a file does not use goes to the files after it
+REVIEW_REPOSITORY_TIME_BUDGET_SECONDS = 600
+# How many files the summary of a repository review lists (the report lists all of them)
+REVIEW_SUMMARY_MAX_FILE_ROWS = 15
 # The shortest time (in seconds) a single model call is given, even when the time guideline is nearly used up
 REVIEW_MIN_CALL_TIMEOUT_SECONDS = 30
 # Stop the review after this many model failures in a row (for example if the model cannot be started)
@@ -111,7 +115,7 @@ REVIEW_MIN_HINT_POINTS = 2
 # The most characters the model may write in the reason or the fix of a finding (the answer is forced to respect this, see build_review_grammar)
 REVIEW_FIELD_MAX_CHARS = 140
 # Text of at least this many characters that does not end with . ! or ? is treated as cut off by the length limit
-REVIEW_CUT_OFF_MIN_CHARS = 60
+REVIEW_CUT_OFF_MIN_CHARS = 100
 # The two kinds of review. Each piece of code is reviewed once for each kind that is worth doing (see chunk_risk.py)
 REVIEW_KIND_SECURITY = "SECURITY"
 REVIEW_KIND_PERFORMANCE = "PERFORMANCE"

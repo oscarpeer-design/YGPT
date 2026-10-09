@@ -103,8 +103,8 @@ class CodeChunker:
         # intialise file path and source
         self.file_path = file_path 
         self.source = source
-        # initialise chunk ids (we will increment from zero)
-        self.next_chunk_id = 0
+        # initialise chunk ids: they continue after the ids already in the shared repository data, so chunks from different files never share an id
+        self.next_chunk_id = max((chunk.chunk_id for chunk in repository_data.chunks), default=-1) + 1
         # create lists of chunks and relationships between those chunks -> stored as RepositoryData object
         self.repository_data = repository_data
         # set language used

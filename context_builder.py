@@ -101,9 +101,10 @@ def describe_chunk_location(chunk: CodeChunk) -> str:
     return f"{chunk.symbol_type.value} '{chunk.chunk_name}', lines {chunk.start_line}-{chunk.end_line}"
 
 # Show a chunk as background code
-def format_related_chunk(chunk: CodeChunk) -> str:
-    # a heading saying what the code is, then the code
-    return f"[{describe_chunk_location(chunk)}]\n{normalise_line_endings(chunk.source)}"
+def format_related_chunk(chunk: CodeChunk, target: CodeChunk) -> str:
+    # a heading saying what the code is (and which file it is in, if that is not the file under review), then the code
+    where = describe_chunk_location(chunk) if chunk.file_path == target.file_path else f"{describe_chunk_location(chunk)} of {Path(chunk.file_path).name}"
+    return f"[{where}]\n{normalise_line_endings(chunk.source)}"
 
 # Build the heading that goes above the code under review
 def build_review_header(target: CodeChunk, enclosing: CodeChunk | None) -> str:
@@ -164,7 +165,7 @@ def build_chunk_review_prompt(
         if len(included) >= REVIEW_RELATED_CHUNK_COUNT:
             break
         # work out how much room this chunk would take (the first one also needs the heading)
-        block = format_related_chunk(candidate) + "\n\n"
+        block = format_related_chunk(candidate, target) + "\n\n"
         extra = len(block)
         if not included:
             extra += len(related_heading)

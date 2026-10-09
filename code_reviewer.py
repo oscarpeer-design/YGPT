@@ -13,8 +13,9 @@ from tqdm import tqdm
 # Import Internal Depenencies
 from chunk_risk import ReviewUnit, rank_chunks_for_review
 from code_chunker import RepositoryData
+from code_parser import ChunkedRepository
 from config import (
-    REVIEW_N_PREDICT, REVIEW_REPEAT_PENALTY, REVIEW_TIME_BUDGET_SECONDS, REVIEW_MIN_CALL_TIMEOUT_SECONDS,
+    REVIEW_N_PREDICT, REVIEW_REPEAT_PENALTY, REVIEW_TIME_BUDGET_SECONDS, REVIEW_REPOSITORY_TIME_BUDGET_SECONDS, REVIEW_SUMMARY_MAX_FILE_ROWS, REVIEW_MIN_CALL_TIMEOUT_SECONDS,
     REVIEW_MAX_CONSECUTIVE_FAILURES, REVIEW_RELATED_CANDIDATES, REVIEW_RELATED_SIMILARITY_THRESHOLD,
     REVIEW_PROGRESS_NAME_CHARS, MODEL_TIMEOUT_SECONDS
 )
@@ -65,6 +66,21 @@ class ReviewResult:
     failed_notes: list[str] = field(default_factory=list) # the reviews the model failed to do
     skipped_notes: list[str] = field(default_factory=list) # the pieces of code that could not be reviewed
 
+    # add the result of another file to this one (used to total a repository)
+    def add(self, other: "ReviewResult") -> None:
+        self.unit_count += other.unit_count
+        self.reviewed += other.reviewed
+        self.cached += other.cached
+        self.unflagged += other.unflagged
+        self.failed += other.failed
+        self.with_findings += other.with_findings
+        self.finding_count += other.finding_count
+        self.unverified += other.unverified
+        self.model_seconds += other.model_seconds
+        self.findings.extend(other.findings)
+        self.failed_notes.extend(other.failed_notes)
+        self.skipped_notes.extend(other.skipped_notes)
+
     # how many reviews were never reached (they are less worthwhile, so they are left for another run)
     def not_reached(self) -> int:
         # every review is either done, failed, or not reached
@@ -88,8 +104,8 @@ class ReviewResult:
             summary += " Run the same review again to continue with the remaining reviews."
         return summary
 
-# Reviews code one piece at a time, most worthwhile first, until everything is done or the time guideline is used up.
-# Each review gets the code itself, the suspicious lines found by a pattern search, and its most similar chunks as background, so every prompt is small enough for the small model.
+# Reviews code one piece at a time, file by file, most worthwhile first within each file, until everything is done or the time guideline is used up.
+# Each review gets the code itself, the suspicious lines found by a pattern search, and its most similar chunks as background (from any file), so every prompt is small enough for the small model.
 class CodeReviewer:
     def __init__(self, model: LocalModel, retriever: Retriever, repository_data: RepositoryData):
         # the model that does the reviews, and the retriever that finds related chunks
@@ -98,25 +114,71 @@ class CodeReviewer:
         # which chunk each chunk is inside
         self.parents = get_parent_chunks(repository_data)
         # the reviews to do, most worthwhile first (only flagged lines are reviewed)
-        plan = rank_chunks_for_review(repository_data)
-        self.units = plan.units
-        # start recording the result (chunks too large for one prompt that contain other chunks are reviewed through those other chunks)
-        self.result = ReviewResult(unit_count=len(self.units), unflagged=plan.unflagged_count)
-        for chunk in plan.not_reviewable:
-            self.result.skipped_notes.append(f"- {describe_chunk_location(chunk)}")
-        # how many model failures there have been in a row
+        self.plan = rank_chunks_for_review(repository_data)
+        # the files, in a stable order (the order of the reviews inside each file stays most worthwhile first)
+        self.files = sorted({chunk.file_path for chunk in repository_data.chunks})
+        # the reviews of each file
+        self.units_by_file: dict[Path, list[ReviewUnit]] = {file_path: [] for file_path in self.files}
+        for unit in self.plan.units:
+            self.units_by_file[unit.chunk.file_path].append(unit)
+        # the result of the file being reviewed (a new one is started for each file)
+        self.result = ReviewResult()
+        # the time (in seconds) the file being reviewed may spend waiting for the model, and how to describe that limit
+        self.time_budget = float(REVIEW_TIME_BUDGET_SECONDS)
+        self.time_budget_description = f"the {describe_duration(REVIEW_TIME_BUDGET_SECONDS)} time guideline"
+        # how many model failures there have been in a row, and why the whole review had to stop (empty if it did not)
         self.consecutive_failures = 0
+        self.abort_reason = ""
 
     # Show a message without breaking the progress bar
     def say(self, message: str) -> None:
         tqdm.write(message)
 
-    # do the reviews and return what was found
-    def run(self) -> ReviewResult:
-        print(f"Doing {len(self.units)} reviews of flagged lines, most worthwhile first, with a guideline of {describe_duration(REVIEW_TIME_BUDGET_SECONDS)} for the model.")
+    # start the result of one file: what was queued, what had nothing flagged, and what is too large to review as a whole
+    def start_result(self, file_path: Path) -> ReviewResult:
+        result = ReviewResult(unit_count=len(self.units_by_file[file_path]), unflagged=self.plan.unflagged_by_file.get(file_path, 0))
+        # chunks too large for one prompt that contain other chunks are reviewed through those other chunks
+        for chunk in self.plan.not_reviewable:
+            if chunk.file_path == file_path:
+                result.skipped_notes.append(f"- {describe_chunk_location(chunk)}")
+        return result
+
+    # review every file, one after another, and return the result of each. A single file gets the single-file guideline, a repository the repository guideline.
+    def run(self, is_repository: bool) -> list[tuple[Path, ReviewResult]]:
+        total_budget = float(REVIEW_REPOSITORY_TIME_BUDGET_SECONDS if is_repository else REVIEW_TIME_BUDGET_SECONDS)
+        file_results: list[tuple[Path, ReviewResult]] = []
+        # the files that have something to review, and how long the model has been waited for so far
+        files_to_review = [file_path for file_path in self.files if self.units_by_file[file_path]]
+        if is_repository:
+            print(f"Reviewing {len(files_to_review)} of {len(self.files)} files one after another, with a guideline of {describe_duration(total_budget)} for the model in total.")
+        else:
+            print(f"Doing {len(self.plan.units)} reviews of flagged lines, most worthwhile first, with a guideline of {describe_duration(total_budget)} for the model.")
         print("Press Ctrl+C to stop early: reviews already done are saved and will not be repeated next time.")
-        # the progress bar counts reviews done
-        progress = tqdm(self.units, desc="Reviewing", unit="review")
+        spent = 0.0
+        for file_path in self.files:
+            self.result = self.start_result(file_path)
+            units = self.units_by_file[file_path]
+            if units:
+                # the file gets the time that is left divided by the files still to do (time that earlier files did not use goes to the later ones)
+                files_left = len(files_to_review) - files_to_review.index(file_path)
+                self.time_budget = max(0.0, total_budget - spent) / files_left
+                self.time_budget_description = f"the {describe_duration(total_budget)} time guideline"
+                # a review that had to stop everything leaves the rest of the files unreviewed
+                if self.abort_reason:
+                    self.result.stop_reason = self.abort_reason
+                else:
+                    if is_repository:
+                        print(f"File {files_to_review.index(file_path) + 1} of {len(files_to_review)}: {file_path} ({len(units)} reviews)")
+                    self.review_units(units, file_path if is_repository else None)
+            spent += self.result.model_seconds
+            file_results.append((file_path, self.result))
+        return file_results
+
+    # do the reviews of one file
+    def review_units(self, units: list[ReviewUnit], file_path: Path | None) -> None:
+        # the progress bar counts reviews done (the file is named in a repository review)
+        description = f"Reviewing {file_path.name}" if file_path is not None else "Reviewing"
+        progress = tqdm(units, desc=description, unit="review")
         try:
             for unit in progress:
                 # show what is being reviewed and how it is going
@@ -127,11 +189,11 @@ class CodeReviewer:
                     break
         except KeyboardInterrupt:
             self.say("\nReview stopped early by the user.")
-            self.result.stop_reason = "it was stopped by the user"
+            self.abort_reason = "it was stopped by the user"
+            self.result.stop_reason = self.abort_reason
         finally:
             # stop the progress bar
             progress.close()
-        return self.result
 
     # describe the review being done and how the whole review is going, for the progress bar
     def describe_progress(self, unit: ReviewUnit) -> str:
@@ -178,8 +240,8 @@ class CodeReviewer:
             self.result.cached += 1
             return saved_response
         # the time guideline is checked before each model call: everything from here on is less worthwhile and is left for another run
-        if self.result.model_seconds >= REVIEW_TIME_BUDGET_SECONDS:
-            self.result.stop_reason = f"the {describe_duration(REVIEW_TIME_BUDGET_SECONDS)} time guideline was reached"
+        if self.result.model_seconds >= self.time_budget:
+            self.result.stop_reason = f"{self.time_budget_description} was reached"
             return None
         response = self.ask_model(prompt, grammar)
         # a failure (or an empty answer) is recorded
@@ -198,7 +260,7 @@ class CodeReviewer:
     # ask the model, timing the call. Returns the answer, or an Exception if the model failed.
     def ask_model(self, prompt: str, grammar: str) -> str | Exception:
         # a call may not run far past the time guideline, but always gets a minimum amount of time
-        remaining = REVIEW_TIME_BUDGET_SECONDS - self.result.model_seconds
+        remaining = self.time_budget - self.result.model_seconds
         call_timeout = min(MODEL_TIMEOUT_SECONDS, max(REVIEW_MIN_CALL_TIMEOUT_SECONDS, remaining))
         # ask the model (its answer is forced into the shape of the grammar)
         started = time.time()
@@ -207,17 +269,18 @@ class CodeReviewer:
         self.result.model_seconds += time.time() - started
         return response
 
-    # record that the model failed to do a review, and stop if it keeps failing
+    # record that the model failed to do a review, and stop everything if it keeps failing
     def record_failure(self, unit: ReviewUnit, response: str | Exception) -> None:
         # show why (an empty answer has no exception to show)
         reason = str(response) if isinstance(response, Exception) else "The model gave an empty answer"
         self.say(f"{reason} ({describe_chunk_location(unit.chunk)})")
         self.result.failed += 1
         self.result.failed_notes.append(f"- {unit.kind.lower()} review of {describe_chunk_location(unit.chunk)}")
-        # too many failures in a row means something is wrong (for example the model can not be started)
+        # too many failures in a row means something is wrong (for example the model can not be started), so no file is worth continuing
         self.consecutive_failures += 1
         if self.consecutive_failures >= REVIEW_MAX_CONSECUTIVE_FAILURES:
-            self.result.stop_reason = f"the model failed {self.consecutive_failures} times in a row"
+            self.abort_reason = f"the model failed {self.consecutive_failures} times in a row"
+            self.result.stop_reason = self.abort_reason
 
     # read the model's answer and keep the findings that are about a flagged line and say something
     def record_findings(self, unit: ReviewUnit, response: str) -> None:
@@ -233,42 +296,118 @@ class CodeReviewer:
             self.say(f"[{unit.kind}] {unit.chunk.chunk_name}, {describe_finding(finding)}")
         self.result.findings.append(build_findings_section(unit, findings))
 
-# Write the review to a markdown file. Returns None, or an Exception if it could not be written.
-def write_review_report(target_path: Path, result: ReviewResult, markdown_path: Path) -> None | Exception:
-    # the title and the summary
-    lines = [f"# Code review: {target_path}", "", result.describe(), "", "## Findings", ""]
+# Add up the results of all the files
+def total_file_results(file_results: list[tuple[Path, ReviewResult]]) -> ReviewResult:
+    total = ReviewResult()
+    # the files' results are added one by one
+    for file_path, result in file_results:
+        total.add(result)
+    return total
+
+# Write a brief summary of a repository review: the files, the reviews, the findings, the time, and the files with the most to look at.
+# max_rows limits how many files are listed (None lists them all).
+def describe_repository_review(chunked: ChunkedRepository, file_results: list[tuple[Path, ReviewResult]], max_rows: int | None) -> str:
+    total = total_file_results(file_results)
+    # files that had reviews queued, and files where nothing was flagged
+    reviewed_files = [item for item in file_results if item[1].unit_count > 0]
+    quiet_files = chunked.file_count - len(chunked.skipped_files) - len(reviewed_files)
+    lines = [
+        f"Files: {chunked.file_count} found, {len(reviewed_files)} reviewed, {quiet_files} with nothing to review, {len(chunked.skipped_files)} could not be read.",
+        f"Reviews: {total.reviewed + total.cached} done ({total.cached} from an earlier run), {total.not_reached()} not reached, {total.failed} failed.",
+        f"Findings: {total.finding_count} kept (in {total.with_findings} reviews), {total.unverified} claims thrown away.",
+        f"Time spent on the model: {total.model_seconds / 60:.1f} minutes (guideline {describe_duration(REVIEW_REPOSITORY_TIME_BUDGET_SECONDS)})."
+    ]
+    # why the review stopped early, if it did
+    stop_reasons = [result.stop_reason for file_path, result in file_results if result.stop_reason]
+    if stop_reasons:
+        # each reason is said once, with the number of files it affected
+        said = [reason if stop_reasons.count(reason) == 1 else f"{reason} ({stop_reasons.count(reason)} files)" for reason in sorted(set(stop_reasons))]
+        lines.append("Stopped early: " + "; ".join(said) + ".")
+    if total.not_reached() > 0:
+        lines.append("Run the same review again to continue with the reviews that were not reached.")
+    # a table of the files with reviews: most findings first, then most reviews not reached
+    if reviewed_files:
+        reviewed_files.sort(key=lambda item: (-item[1].finding_count, -item[1].not_reached(), str(item[0])))
+        shown = reviewed_files if max_rows is None else reviewed_files[:max_rows]
+        lines.extend(["", "| File | Reviews done | Findings | Not reached |", "| --- | --- | --- | --- |"])
+        for file_path, result in shown:
+            lines.append(f"| {file_path.name} | {result.reviewed + result.cached} of {result.unit_count} | {result.finding_count} | {result.not_reached()} |")
+        if len(shown) < len(reviewed_files):
+            lines.append(f"| ...and {len(reviewed_files) - len(shown)} more files (all of them are in the report) | | | |")
+    return "\n".join(lines)
+
+# The parts of a report about one file's findings and what could not be reviewed. heading is the markdown heading marker for the parts (for example "##").
+def build_result_sections(result: ReviewResult, heading: str) -> list[str]:
     # the findings, or a note that there are none
+    lines = [f"{heading} Findings", ""]
     lines.extend(result.findings if result.findings else ["No findings were reported.", ""])
     # the code that could not be reviewed
     if result.skipped_notes:
-        lines.extend(["## Not reviewed as a whole: too large for one prompt (functions inside them are reviewed on their own)", ""] + result.skipped_notes + [""])
+        lines.extend([f"{heading} Not reviewed as a whole: too large for one prompt (functions inside them are reviewed on their own)", ""] + result.skipped_notes + [""])
     if result.failed_notes:
-        lines.extend(["## Not reviewed: the model failed", ""] + result.failed_notes + [""])
-    # a reminder of how far the findings can be trusted
-    lines.append("_Reviewed by a small local model. Each finding is about a line that a pattern search flagged and the model judged, but whether it is truly a defect still has to be checked._")
+        lines.extend([f"{heading} Not reviewed: the model failed", ""] + result.failed_notes + [""])
+    return lines
+
+# A reminder of how far the findings can be trusted
+REPORT_REMINDER = "_Reviewed by a small local model. Each finding is about a line that a pattern search flagged and the model judged, but whether it is truly a defect still has to be checked._"
+
+# Write text to a markdown file. Returns None, or an Exception if it could not be written.
+def write_markdown(markdown_path: Path, lines: list[str]) -> None | Exception:
     try:
         markdown_path.parent.mkdir(parents=True, exist_ok=True)
         markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     except Exception as e:
         return Exception(f"Unable to write the review to {markdown_path}. Error: {e}")
 
-# Review chunked code with the model and write the report if a markdown path was given. Returns None, or an Exception if the review could not be done.
-def review_chunks(target_path: Path, repository_data: RepositoryData, model: LocalModel, markdown_path: Path | None) -> None | Exception:
-    # embed the chunks so that related chunks can be found (embeddings are saved, so an unchanged file is not embedded again)
+# Write the review of a single file to a markdown file. Returns None, or an Exception if it could not be written.
+def write_review_report(target_path: Path, result: ReviewResult, markdown_path: Path) -> None | Exception:
+    # the title and the summary, then the findings and what could not be reviewed
+    lines = [f"# Code review: {target_path}", "", result.describe(), ""] + build_result_sections(result, "##")
+    lines.append(REPORT_REMINDER)
+    return write_markdown(markdown_path, lines)
+
+# Write the review of a repository to a markdown file: the summary, then one section for each file that has findings or something that could not be reviewed.
+# Returns None, or an Exception if it could not be written.
+def write_repository_report(target_path: Path, chunked: ChunkedRepository, file_results: list[tuple[Path, ReviewResult]], markdown_path: Path) -> None | Exception:
+    lines = [f"# Code review: {target_path}", "", "## Summary", "", describe_repository_review(chunked, file_results, None), ""]
+    # one section for each file that has something to say
+    for file_path, result in file_results:
+        if result.findings or result.skipped_notes or result.failed_notes:
+            # each finding's heading goes one level below the file's parts
+            deeper = ReviewResult(findings=[text.replace("### ", "#### ", 1) if text.startswith("### ") else text for text in result.findings], skipped_notes=result.skipped_notes, failed_notes=result.failed_notes)
+            lines.extend([f"## {file_path}", ""] + build_result_sections(deeper, "###"))
+    # the files that could not be read
+    if chunked.skipped_files:
+        lines.extend(["## Files that could not be read", ""] + chunked.skipped_files + [""])
+    lines.append(REPORT_REMINDER)
+    return write_markdown(markdown_path, lines)
+
+# Review chunked code with the model, file by file, and write the report if a markdown path was given.
+# chunked is given for a repository (None for a single file). Returns None, or an Exception if the review could not be done.
+def review_chunks(target_path: Path, repository_data: RepositoryData, model: LocalModel, markdown_path: Path | None, chunked: ChunkedRepository | None = None) -> None | Exception:
+    # embed the chunks of all the files so that related chunks can be found (embeddings are saved, so unchanged code is not embedded again)
     embedder = Embedder(repository_data)
     embedding_result = embedder.create_chunk_vector_embeddings()
     if isinstance(embedding_result, Exception):
         return Exception(f"Unable to embed the chunks: {embedding_result}")
     # create the retriever used to find related chunks
     retriever = Retriever(repository_data.chunks, embedder.embedding_state)
-    # review the chunks one at a time and say how it went
-    result = CodeReviewer(model, retriever, repository_data).run()
-    print(result.describe())
-    # there is no report to write
-    if markdown_path is None:
-        return None
-    # write the report
-    written = write_review_report(target_path, result, markdown_path)
+    # review the files one at a time and say how it went
+    file_results = CodeReviewer(model, retriever, repository_data).run(chunked is not None)
+    if chunked is not None:
+        # a repository: a brief summary of all the files
+        print(describe_repository_review(chunked, file_results, REVIEW_SUMMARY_MAX_FILE_ROWS))
+        # there is no report to write
+        if markdown_path is None:
+            return None
+        written = write_repository_report(target_path, chunked, file_results, markdown_path)
+    else:
+        # a single file: the summary of its review
+        result = file_results[0][1] if file_results else ReviewResult()
+        print(result.describe())
+        if markdown_path is None:
+            return None
+        written = write_review_report(target_path, result, markdown_path)
     if isinstance(written, Exception):
         return written
     print(f"Wrote the review to {markdown_path}")

@@ -5,6 +5,8 @@
 # Import external dependencies
 # dataclass: used to create struct-like classes
 from dataclasses import dataclass
+# Path: library used to find file paths on computer
+from pathlib import Path
 # re: regular expressions, used to find risk signals in code
 import re
 
@@ -107,6 +109,7 @@ class ReviewUnit:
 class ReviewPlan:
     units: list[ReviewUnit] # the reviews to do, most worthwhile first
     unflagged_count: int # how many chunks had no flagged lines, so there was nothing to ask the model
+    unflagged_by_file: dict[Path, int] # the same count for each file
     not_reviewable: list[CodeChunk] # chunks too large to review as a whole (the chunks inside them are reviewed on their own)
 
 # Pick the chunks to review: every function/method, plus any other chunk that has no chunks inside it.
@@ -290,7 +293,9 @@ def find_hot_callees(repository_data: RepositoryData) -> dict[int, str]:
                     continue
                 for callee in candidates:
                     if callee.chunk_id != caller.chunk_id and callee.chunk_id not in hot:
-                        hot[callee.chunk_id] = f"It is called inside a loop at line {caller.start_line + index} of {caller.symbol_type.value} '{caller.chunk_name}'."
+                        # say which file the caller is in if it is not the callee's file
+                        caller_file = "" if caller.file_path == callee.file_path else f" in {Path(caller.file_path).name}"
+                        hot[callee.chunk_id] = f"It is called inside a loop at line {caller.start_line + index} of {caller.symbol_type.value} '{caller.chunk_name}'{caller_file}."
     return hot
 
 # Score what makes a whole chunk matter more, whatever its lines are: it calls itself, it handles outside data, or it is complicated.
@@ -427,7 +432,7 @@ def rank_chunks_for_review(repository_data: RepositoryData) -> ReviewPlan:
     container_ids = get_container_ids(repository_data)
     # which functions are called from inside loops elsewhere
     hot_callees = find_hot_callees(repository_data)
-    plan = ReviewPlan([], 0, [])
+    plan = ReviewPlan([], 0, {}, [])
     for index in get_reviewable_chunk_indices(repository_data):
         chunk = repository_data.chunks[index]
         # the lines flagged anywhere in the chunk (loops are followed across the whole chunk, so this is done before cutting it into windows)
@@ -436,6 +441,7 @@ def rank_chunks_for_review(repository_data: RepositoryData) -> ReviewPlan:
         # nothing flagged: nothing to ask the model
         if not security_hints and not performance_hints:
             plan.unflagged_count += 1
+            plan.unflagged_by_file[chunk.file_path] = plan.unflagged_by_file.get(chunk.file_path, 0) + 1
             continue
         # a chunk that contains other chunks and is not short is left to the chunks inside it
         is_short = len(chunk.source) <= REVIEW_WHOLE_CHUNK_CHARS
