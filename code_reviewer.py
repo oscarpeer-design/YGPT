@@ -17,21 +17,14 @@ from code_parser import ChunkedRepository
 from config import (
     REVIEW_N_PREDICT, REVIEW_REPEAT_PENALTY, REVIEW_TIME_BUDGET_SECONDS, REVIEW_REPOSITORY_TIME_BUDGET_SECONDS, REVIEW_SUMMARY_MAX_FILE_ROWS, REVIEW_MIN_CALL_TIMEOUT_SECONDS,
     REVIEW_MAX_CONSECUTIVE_FAILURES, REVIEW_RELATED_CANDIDATES, REVIEW_RELATED_SIMILARITY_THRESHOLD,
-    REVIEW_PROGRESS_NAME_CHARS, MODEL_TIMEOUT_SECONDS
+    REVIEW_PROGRESS_NAME_CHARS, MODEL_TIMEOUT_SECONDS, SECONDS_PER_MINUTE
 )
 from context_builder import (
     build_chunk_review_prompt, build_review_grammar, describe_chunk_location, get_parent_chunks,
-    get_review_cache_path, load_cached_review, save_cached_review
+    get_review_cache_path, load_cached_review, save_cached_review, describe_duration
 )
 from embedder_and_retriever import Embedder, Retriever
 from model import LocalModel, ReviewFinding, parse_review_findings
-
-# Describe a number of seconds in plain words (e.g. "5 minute" or "90 second")
-def describe_duration(seconds: float) -> str:
-    # from two minutes up, minutes are easier to read
-    if seconds >= 120:
-        return f"{seconds / 60:.0f} minute"
-    return f"{seconds:.0f} second"
 
 # Describe a finding on one line
 def describe_finding(finding: ReviewFinding) -> str:
@@ -93,7 +86,7 @@ class ReviewResult:
             f"Did {self.reviewed + self.cached} of {self.unit_count} reviews, most worthwhile first ({self.cached} from an earlier run). "
             f"{self.finding_count} findings (in {self.with_findings} reviews); {self.unverified} claims were thrown away (they named a line that was not flagged, argued against themselves, or only repeated the flag). "
             f"Not done: {self.not_reached()} not reached, {self.unflagged} chunks had no flagged lines, {len(self.skipped_notes)} too large to review as a whole, {self.failed} failed. "
-            f"Time spent on the model: {self.model_seconds / 60:.1f} minutes."
+            f"Time spent on the model: {self.model_seconds / SECONDS_PER_MINUTE:.1f} minutes."
         )
         # the average only makes sense if the model did a review in this run
         if self.reviewed > 0:
@@ -315,7 +308,7 @@ def describe_repository_review(chunked: ChunkedRepository, file_results: list[tu
         f"Files: {chunked.file_count} found, {len(reviewed_files)} reviewed, {quiet_files} with nothing to review, {len(chunked.skipped_files)} could not be read.",
         f"Reviews: {total.reviewed + total.cached} done ({total.cached} from an earlier run), {total.not_reached()} not reached, {total.failed} failed.",
         f"Findings: {total.finding_count} kept (in {total.with_findings} reviews), {total.unverified} claims thrown away.",
-        f"Time spent on the model: {total.model_seconds / 60:.1f} minutes (guideline {describe_duration(REVIEW_REPOSITORY_TIME_BUDGET_SECONDS)})."
+        f"Time spent on the model: {total.model_seconds / SECONDS_PER_MINUTE:.1f} minutes (guideline {describe_duration(REVIEW_REPOSITORY_TIME_BUDGET_SECONDS)})."
     ]
     # why the review stopped early, if it did
     stop_reasons = [result.stop_reason for file_path, result in file_results if result.stop_reason]

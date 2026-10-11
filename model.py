@@ -134,7 +134,8 @@ class LocalModel():
     # timeout (in seconds) defaults to MODEL_TIMEOUT_SECONDS, but a shorter one can be given
     # grammar (a llama.cpp grammar) forces the model's answer into a fixed shape
     # repeat_penalty (above 1.0) discourages the model from repeating itself
-    def query_model(self, prompt: str, n_predict = 1024, timeout: float | None = None, grammar: str | None = None, repeat_penalty: float | None = None) -> str | Exception:
+    # temperature defaults to TEMPERATURE, but a different one can be given
+    def query_model(self, prompt: str, n_predict = 1024, timeout: float | None = None, grammar: str | None = None, repeat_penalty: float | None = None, temperature: float | None = None) -> str | Exception:
         # llama-cli reads a grammar from a file, so a grammar is written to a temporary file for the length of the call
         grammar_path = None
         try:
@@ -152,7 +153,7 @@ class LocalModel():
                     "llama-cli", # Llamma-cli: the program that will run the local model
                     "-m", str(self.model_path), # The path to the local LLM
                      "-p", prompt, # The prompt that will be run
-                    "--temp", str(TEMPERATURE), # The temperature
+                    "--temp", str(TEMPERATURE if temperature is None else temperature), # The temperature
                     "--ctx-size", str(MODEL_CTX), # The context size available
                     "--threads", str(CPU_THREADS_USED), # The number of threads used to write the answer
                     "--threads-batch", str(CPU_THREADS_USED), # The number of threads used to read the prompt (the slow part of a long prompt)

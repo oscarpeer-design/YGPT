@@ -276,3 +276,96 @@ def save_cached_review(cache_path: Path, response: str) -> None | Exception:
         os.replace(temp_path, cache_path)
     except Exception as e:
         return Exception(f"Unable to save the review {cache_path}. Error: {e}")
+
+# Describe a number of seconds in plain words (e.g. "5 minute" or "90 second")
+def describe_duration(seconds: float) -> str:
+    # from two minutes up, minutes are easier to read
+    if seconds >= DURATION_MINUTES_FROM_SECONDS:
+        return f"{seconds / SECONDS_PER_MINUTE:.0f} minute"
+    return f"{seconds:.0f} second"
+
+# How many tokens an answer of this many characters needs (a token is about CHARS_PER_TOKEN characters, plus some room to spare)
+def get_answer_tokens(answer_chars: int) -> int:
+    return answer_chars // CHARS_PER_TOKEN + DOCUMENT_ANSWER_SLACK_TOKENS
+
+# How many characters a documentation prompt may use so that the prompt AND the model's answer both fit in the context window.
+# answer_chars is the longest answer the model may write (about 3 characters to a token).
+def get_document_prompt_char_budget(answer_chars: int) -> int:
+    tokens_for_answer = get_answer_tokens(answer_chars)
+    tokens_available = MODEL_CTX - tokens_for_answer
+    tokens_for_prompt = min(tokens_available, DOCUMENT_MAX_PROMPT_TOKENS)
+    return int(tokens_for_prompt * CHARS_PER_TOKEN * PROMPT_SAFETY_FACTOR)
+
+# Cut code to at most max_chars, at the end of a line
+def fit_code_excerpt(code: str, max_chars: int) -> str:
+    code = normalise_line_endings(code).strip("\n")
+    if len(code) <= max_chars:
+        return code
+    # cut at the last line end that fits
+    cut = code.rfind("\n", 0, max_chars)
+    return code[:cut if cut > 0 else max_chars]
+
+# Build the prompt that asks what a file is for and how it works. described are (name, what it does) for the functions that were already described; types are the classes, structs and enums it defines; names are everything it defines.
+def build_file_overview_prompt(file_name: str, language: str, line_count: int, described: list[tuple[str, str]], types: list[str], names: list[str]) -> str:
+    budget = get_document_prompt_char_budget(DOCUMENT_OVERVIEW_MAX_CHARS)
+    prompt = f"{DOCUMENT_OVERVIEW_INSTRUCTION}\nFILE: {file_name} ({language}, {line_count} lines)\n"
+    # what the main functions do comes first because it says the most
+    if described:
+        prompt += "\nWHAT ITS MAIN FUNCTIONS DO:\n"
+        for name, text in described:
+            line = f"- {name}: {text}\n"
+            if len(prompt) + len(line) > budget:
+                break
+            prompt += line
+    # the types come before the other names, because what a class is for is what a file with a class is about
+    if types:
+        prompt += "\nTYPES THE FILE DEFINES (names only):\n"
+        for name in types:
+            line = f"- {name}\n"
+            if len(prompt) + len(line) > budget:
+                break
+            prompt += line
+    # the other names show what else the file has
+    if names:
+        prompt += "\nEVERYTHING THE FILE DEFINES (names only):\n"
+        for name in names:
+            line = f"- {name}\n"
+            if len(prompt) + len(line) > budget:
+                break
+            prompt += line
+    return prompt
+
+# Build the prompt that asks what one function does. callee_signatures are the declarations of the functions it calls, as background.
+def build_function_documentation_prompt(file_name: str, signature: str, code: str, callee_signatures: list[str]) -> str:
+    budget = get_document_prompt_char_budget(DOCUMENT_FUNCTION_MAX_CHARS)
+    prompt = f"{DOCUMENT_FUNCTION_INSTRUCTION}\nExample of a good answer: {DOCUMENT_FUNCTION_EXAMPLE}\n\nFUNCTION: {signature} (in {file_name})\n"
+    # the background goes after the code, so it is first to be cut when there is no room
+    background = ""
+    if callee_signatures:
+        background = "\nIT CALLS (do not describe these):\n" + "".join(f"- {signature_line}\n" for signature_line in callee_signatures)
+    room_for_code = budget - len(prompt) - len("\nCODE:\n") - 1
+    code_text = fit_code_excerpt(code, room_for_code)
+    prompt += f"\nCODE:\n{code_text}\n"
+    if len(prompt) + len(background) <= budget:
+        prompt += background
+    return prompt
+
+# Build the prompt that asks what a whole project does. notes are one line for each file ("name: what it does").
+def build_repository_overview_prompt(notes: list[str]) -> str:
+    budget = get_document_prompt_char_budget(DOCUMENT_REPOSITORY_MAX_CHARS)
+    prompt = f"{DOCUMENT_REPOSITORY_INSTRUCTION}\nFILES:\n"
+    for note in notes:
+        if len(prompt) + len(note) + DOCUMENT_LIST_LINE_CHARS > budget:
+            break
+        prompt += f"- {note}\n"
+    return prompt
+
+# A grammar that makes the answer one line of text of the allowed length (the model can stop as soon as it has at least the shortest length)
+def build_document_grammar(max_chars: int) -> str:
+    return f"root ::= [^\\n]{{{DOCUMENT_MIN_ANSWER_CHARS},{max_chars}}}\n"
+
+# Get the path where the model's answer to a documentation prompt is saved. The name is a digest of everything that shapes the answer.
+def get_documentation_cache_path(model_name: str, prompt: str, grammar: str, n_predict: int) -> Path:
+    cache_folder = Path(__file__).resolve().parent / DOCUMENT_CACHE_FOLDER_NAME
+    digest = get_text_digest([str(DOCUMENT_CACHE_VERSION), model_name, str(n_predict), str(DOCUMENT_REPEAT_PENALTY), str(MODEL_CTX), str(DOCUMENT_TEMPERATURE), grammar, prompt])
+    return cache_folder / f"{digest}.txt"

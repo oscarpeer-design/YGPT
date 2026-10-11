@@ -204,6 +204,8 @@ def chunk_code_file(file_path: Path, repository_data: RepositoryData) -> None|Ex
     # remember how much data there was, so that a file that fails half way leaves nothing behind
     chunk_count = len(repository_data.chunks)
     relationship_count = len(repository_data.relationships)
+    include_count = len(repository_data.includes)
+    constant_count = len(repository_data.constants)
     try:
         # the chunker adds the chunks of the file to the shared repository data
         chunker = CodeChunker(
@@ -216,6 +218,9 @@ def chunk_code_file(file_path: Path, repository_data: RepositoryData) -> None|Ex
     except Exception as e:
         del repository_data.chunks[chunk_count:]
         del repository_data.relationships[relationship_count:]
+        del repository_data.includes[include_count:]
+        del repository_data.constants[constant_count:]
+        repository_data.line_counts.pop(file_path, None)
         return Exception(f"Unable to chunk the file {file_path}. Error: {e}")
 
 # chunk every code file in a repository into one shared RepositoryData, one file at a time (a parse tree is dropped as soon as its file is chunked).

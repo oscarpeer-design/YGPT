@@ -80,6 +80,84 @@ REVIEW_TIME_BUDGET_SECONDS = 300
 REVIEW_REPOSITORY_TIME_BUDGET_SECONDS = 600
 # How many files the summary of a repository review lists (the report lists all of them)
 REVIEW_SUMMARY_MAX_FILE_ROWS = 15
+
+# Define parameters for documenting code (the DOCUMENT command)
+# How many functions of each file are documented one by one (the most important ones; the rest are only listed by signature)
+DOCUMENT_FUNCTIONS_PER_FILE = 3
+# How many signatures of the functions that an important function calls are shown to the model as background
+DOCUMENT_MAX_CALLEE_SIGNATURES = 4
+# How many callers are named when saying where an important function is called from
+DOCUMENT_MAX_NAMED_CALLERS = 3
+# Guideline for the total time (in seconds) documenting spends waiting for the model: one file, or a whole repository (files are done one after another, each with its share of the time left)
+DOCUMENT_TIME_BUDGET_SECONDS = 300
+DOCUMENT_REPOSITORY_TIME_BUDGET_SECONDS = 600
+# Time (in seconds) kept back from the files for the overview of a whole repository, which is written last
+DOCUMENT_REPOSITORY_OVERVIEW_RESERVE_SECONDS = 30
+# The most characters the model may write for each part of the documentation (a part that reaches this length is cut back to its last whole sentence)
+DOCUMENT_OVERVIEW_MAX_CHARS = 450
+DOCUMENT_FUNCTION_MAX_CHARS = 300
+DOCUMENT_REPOSITORY_MAX_CHARS = 450
+# The shortest answer that is used (anything shorter says nothing)
+DOCUMENT_MIN_ANSWER_CHARS = 20
+# How the model is asked: it repeats itself less with a penalty, and the prompt is capped so that each call stays quick
+DOCUMENT_REPEAT_PENALTY = 1.1
+# Room (in tokens) kept beyond the longest answer, for the end-of-answer marker and a miscounted token or two
+DOCUMENT_ANSWER_SLACK_TOKENS = 10
+# The characters a list line adds to a prompt besides its text ("- " and the line end)
+DOCUMENT_LIST_LINE_CHARS = 3
+# How many file names are listed when saying which files use a file
+DOCUMENT_MAX_NAMED_FILES = 6
+# How many names are listed in a sentence about what a file depends on, before it says how many more there are
+DOCUMENT_MAX_LISTED_DEPENDENCIES = 8
+# Maximum characters of a signature that is kept (a long declaration is cut here)
+DOCUMENT_MAX_SIGNATURE_CHARS = 240
+# Durations: a time is described in minutes from this many seconds, and this many seconds make a minute
+DURATION_MINUTES_FROM_SECONDS = 120
+SECONDS_PER_MINUTE = 60
+# Documentation uses no randomness: the model always picks its most likely wording, which invents less than a sampled one
+DOCUMENT_TEMPERATURE = 0.0
+DOCUMENT_MAX_PROMPT_TOKENS = 1024
+# Name of the folder (created next to the code) where the model's answers are saved, and a number that makes every saved answer stale when it is changed
+DOCUMENT_CACHE_FOLDER_NAME = ".documentation_cache"
+DOCUMENT_CACHE_VERSION = 2
+# How many signatures are listed for a file, and how many include arrows are drawn in the diagram of a repository
+DOCUMENT_MAX_LISTED_SYMBOLS = 30
+DOCUMENT_MAX_DIAGRAM_EDGES = 40
+# How many files are named when saying which files matter most in a repository
+DOCUMENT_MAX_CORE_FILES = 6
+# How many files are listed in the summary of documenting a repository
+DOCUMENT_SUMMARY_MAX_FILE_ROWS = 15
+
+# The instructions for the parts of the documentation. They are kept short and plain because the small model copies wording it can quote.
+DOCUMENT_OVERVIEW_INSTRUCTION = """
+Write exactly two sentences about this file as a whole, not about one function.
+The first says what the file is responsible for. If the file defines a type, it says what the type is for.
+The second says how it works.
+Use only the function descriptions and names below.
+"""
+DOCUMENT_FUNCTION_INSTRUCTION = """
+Say what this function does in one sentence of about 25 words.
+Describe only what the code does, not why it is useful.
+Use only the code below.
+"""
+# One short example of a good answer for each kind of part. It is about something else on purpose, because the model copies the style of an example
+DOCUMENT_FUNCTION_EXAMPLE = "Adds up every number in the list and returns the total."
+DOCUMENT_REPOSITORY_INSTRUCTION = """
+Write two sentences saying what this project does, using the notes on its files below.
+"""
+# Many answers about a function start by naming it ("The function `X` ..."), which wastes room. This pattern (case does not matter) matches that start so that it can be removed
+DOCUMENT_SUBJECT_PATTERN = r"^(?:the\s+)?(?:function|method|constructor|destructor)\s+`[^`]*`(?:\s+(?:function|method))?\s*"
+# An answer that starts with one of these words after the function's name was removed is a fragment ("is designed to ..."), so the name is kept
+DOCUMENT_FRAGMENT_START_PATTERN = r"^(?:is|are|was|were|has|have|can|will|does|do)\b"
+# The mark that cleaning a model's answer puts at a cut-off end, and the marks where an unfinished end can be cut back to
+DOCUMENT_CUT_OFF_MARK = "..."
+DOCUMENT_CLAUSE_MARKS = ",;:"
+# How many sentences of an answer are kept (the model sometimes adds more, and the rest is cut off)
+DOCUMENT_OVERVIEW_SENTENCES = 2
+DOCUMENT_FUNCTION_SENTENCES = 2
+DOCUMENT_REPOSITORY_SENTENCES = 2
+# The model tends to copy wording from its instructions. An answer that repeats this many words in a row from its own instruction is thrown away
+DOCUMENT_COPY_WORD_RUN = 5
 # The shortest time (in seconds) a single model call is given, even when the time guideline is nearly used up
 REVIEW_MIN_CALL_TIMEOUT_SECONDS = 30
 # Stop the review after this many model failures in a row (for example if the model cannot be started)
@@ -148,3 +226,5 @@ CODE_REVIEW_PERFORMANCE_CHUNK_INSTRUCTION = f"""
 Check the FLAGGED LINES of this code for PERFORMANCE problems: needless copying, repeated work inside loops, wasteful allocation, accidental O(n^2) or worse, repeated file access or queries.
 Most flagged lines are false alarms: report one only if it is really slow. The fix must be low-risk and must not change what the code does. RELATED CODE is background only.
 {REVIEW_OUTPUT_FORMAT}"""
+# The characters that may be put around a path typed in a command (for example a path with spaces in it)
+PATH_QUOTE_CHARACTERS = "\"'"

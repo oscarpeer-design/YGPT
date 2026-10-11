@@ -4,7 +4,7 @@
 # enum: ENUM library
 from enum import Enum
 # dataclass annotation: used for data-class structs
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 # tree-sitter: used for nodes
 from tree_sitter import Language, Node, Tree
 # Path: library used to find file paths on computer
@@ -12,7 +12,12 @@ from pathlib import Path
 # deque: used for walking parse tree
 from collections import deque
 # bisect_right: used to turn byte offsets into line numbers
+# re: regular expressions, used to remove comments from signatures
+import re
 from bisect import bisect_right
+# Import Internal Dependencies
+# DOCUMENT_MAX_SIGNATURE_CHARS: the longest signature kept for a chunk (a longer one is cut)
+from config import DOCUMENT_MAX_SIGNATURE_CHARS
 
 # set enums for code module types
 class SymbolType(Enum):
@@ -51,6 +56,12 @@ CPP_IDENTIFIER_NODES = {
     "field_identifier"
 }
 
+# set the node types that include a header, and that call a function, in C++
+CPP_INCLUDE_NODES = {"preproc_include"}
+CPP_CALL_NODES = {"call_expression"}
+# set the node types that define a constant at the top level of a file (a #define in C++, an assignment statement in Python)
+CPP_CONSTANT_NODES = {"preproc_def", "preproc_function_def"}
+
 # set language for Python
 LANGUAGE_PYTHON = "Python"
 # set independent Python specifiers from a parse tree (these are independent nodes that may form relationships with other nodes)
@@ -64,7 +75,10 @@ INDEPENDENT_PYTHON_SPECIFIERS = {
 PYTHON_DECLARATION_CONTAINERS = {"class_definition", "function_definition"}
 # set up identifier nodes where we can identify names of chunks
 PYTHON_IDENTIFIER_NODES = {"identifier"}
-
+# set the node types that import a module, and that call a function, in Python
+PYTHON_INCLUDE_NODES = {"import_statement", "import_from_statement"}
+PYTHON_CALL_NODES = {"call"}
+PYTHON_CONSTANT_NODES = {"expression_statement"}
 # The CodeChunk structure is the smallest unit of analysis within a code base
 @dataclass
 class CodeChunk:
@@ -76,6 +90,8 @@ class CodeChunk:
     symbol_type: SymbolType # type of chunk
     start_line: int # line in code where chunk starts
     end_line: int # line of code where chunk ends
+    called_names: list[str] = field(default_factory=list) # names of the functions this chunk calls (read from the call nodes of the parse tree, each name once)
+    signature: str = "" # the declaration of the chunk without its body, on one line (for example the name, parameters and return type of a function)
 
 # The Relationship structure defines how chunks interact
 @dataclass
@@ -91,11 +107,29 @@ class DiscoveredNode:
     symbol_type: SymbolType # type of chunk
     parent_chunk_id: int | None # id of parent node (may not have a parent)
 
+# A FileInclude is one #include (C++) or import (Python) line found in a code file
+@dataclass
+class FileInclude:
+    file_path: Path # path of the file that includes or imports
+    target: str # what is included (a header such as 'vector' or 'my.h') or imported (a module such as 'os.path')
+    is_system: bool # True for a C++ include in angle brackets <like this> (such an include is never part of the repository)
+    line: int # line of the include or import
+
+# A FileConstant is one top-level constant or setting of a file: a Python assignment such as NAME = 3, or a C++ #define
+@dataclass
+class FileConstant:
+    file_path: Path # path of the file that defines it
+    name: str # its name
+    line: int # line it is defined on
+
 # Hold repository data in a shareable struct
 @dataclass
 class RepositoryData:
     chunks: list[CodeChunk]
     relationships: list[Relationship]
+    includes: list[FileInclude] = field(default_factory=list)
+    constants: list[FileConstant] = field(default_factory=list) # the top-level constants and settings of every file
+    line_counts: dict[Path, int] = field(default_factory=dict) # how many lines each file has
 
 # Chunker responsible for taking a code file in a language and its source and creating a structure of important chunks
 class CodeChunker:
@@ -113,7 +147,12 @@ class CodeChunker:
         self.independent_specifiers = {}
         self.declaration_containers = {}
         self.identifier_nodes = {}
+        self.include_nodes = {}
+        self.call_nodes = {}
+        self.constant_nodes = {}
         self.set_language_features()
+        # the chunks of this file by id (calls found in a chunk are added to it)
+        self.chunks_by_id: dict[int, CodeChunk] = {}
         # track number of visited nodes
         self.nodes_visited = 0
         # get the byte offset at which each line of the source starts (used to work out line numbers)
@@ -127,11 +166,17 @@ class CodeChunker:
             self.independent_specifiers = INDEPENDENT_CPP_SPECIFIERS
             self.declaration_containers = CPP_DECLARATION_CONTAINERS
             self.identifier_nodes = CPP_IDENTIFIER_NODES
+            self.include_nodes = CPP_INCLUDE_NODES
+            self.call_nodes = CPP_CALL_NODES
+            self.constant_nodes = CPP_CONSTANT_NODES
         # Python used 
         elif self.language_used == LANGUAGE_PYTHON:
             self.independent_specifiers = INDEPENDENT_PYTHON_SPECIFIERS
             self.declaration_containers = PYTHON_DECLARATION_CONTAINERS
             self.identifier_nodes = PYTHON_IDENTIFIER_NODES
+            self.include_nodes = PYTHON_INCLUDE_NODES
+            self.call_nodes = PYTHON_CALL_NODES
+            self.constant_nodes = PYTHON_CONSTANT_NODES
         else:
             # The language used is not handled yet
             raise Exception(f"Unable to create code chunks for programming language {self.language_used} yet.")
@@ -139,6 +184,8 @@ class CodeChunker:
     # chunk a parse Tree, starting from the root node
     def chunk(self, root_node: Node) -> None:
         self.walk_node(root_node, None)
+        # remember how many lines the file has (a final line end does not start another line)
+        self.repository_data.line_counts[self.file_path] = len(self.line_starts) - (1 if self.source.endswith(b"\n") else 0)
 
     # walk the parse Tree, identifying important features and adding those features as code chunks
     def walk_node(self, root_node: Node,parent_chunk_id: int|None) -> None:
@@ -162,6 +209,14 @@ class CodeChunker:
             child_parent_id = current_parent_id
             # only named nodes can become chunks
             if node.is_named:
+                # an include or import line belongs to the file, and a call belongs to the chunk it is inside
+                if node.type in self.include_nodes:
+                    self.record_includes(node)
+                elif node.type in self.call_nodes:
+                    self.record_call(node, current_parent_id)
+                # a constant or setting at the top level of the file belongs to the file
+                if len(parent_stack) == 1 and node.type in self.constant_nodes:
+                    self.record_constants(node)
                 # check if we have discovered a node that should become a code chunk
                 discovered = self.discover_node(node, current_parent_id)
                 if discovered is not None:
@@ -171,6 +226,7 @@ class CodeChunker:
                     if chunk is not None:
                         # append the chunk
                         self.repository_data.chunks.append(chunk)
+                        self.chunks_by_id[chunk.chunk_id] = chunk
                         # check if we discovered a parent of the current chunk
                         if current_parent_id is not None:
                             # add the new relationship
@@ -243,8 +299,98 @@ class CodeChunker:
             language=self.language_used,
             symbol_type=discovered.symbol_type,
             start_line=bisect_right(self.line_starts, node.start_byte),
-            end_line=bisect_right(self.line_starts, node.end_byte)
+            end_line=bisect_right(self.line_starts, node.end_byte),
+            signature=self.extract_signature(node)
         )
+
+    # get the declaration of a chunk without its body, on one line
+    def extract_signature(self, node: Node) -> str:
+        # the declaration ends where the body starts (a node without a body is all declaration)
+        body = node.child_by_field_name("body")
+        end_byte = body.start_byte if body is not None else node.end_byte
+        text = self.source[node.start_byte:end_byte].decode("utf-8", errors="replace")
+        # comments between the declaration and the body are not part of it
+        text = re.sub(r"#[^\n]*" if self.language_used == LANGUAGE_PYTHON else r"//[^\n]*", "", text)
+        # one line with single spaces, and not too long
+        text = " ".join(text.split())
+        return text[:DOCUMENT_MAX_SIGNATURE_CHARS]
+
+    # record the constants that a top-level node defines as FileConstants
+    def record_constants(self, node: Node) -> None:
+        line = bisect_right(self.line_starts, node.start_byte)
+        names: list[Node] = []
+        if self.language_used == LANGUAGE_CPP:
+            # #define NAME value
+            name_node = node.child_by_field_name("name")
+            if name_node is not None:
+                names.append(name_node)
+        else:
+            # NAME = value (only a plain name on the left counts, not NAME[0] = value or a, b = 1, 2)
+            for child in node.children:
+                if child.type == "assignment":
+                    left = child.child_by_field_name("left")
+                    if left is not None and left.type == "identifier":
+                        names.append(left)
+        for name_node in names:
+            self.repository_data.constants.append(FileConstant(self.file_path, self.source[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="replace"), line))
+
+    # record the include or imports of an include node as FileIncludes
+    def record_includes(self, node: Node) -> None:
+        line = bisect_right(self.line_starts, node.start_byte)
+        targets: list[tuple[str, bool]] = []
+        if self.language_used == LANGUAGE_CPP:
+            # #include <header> or #include "header"
+            path = node.child_by_field_name("path")
+            if path is not None:
+                targets.append((path.text.decode("utf-8", errors="replace").strip('<>"'), path.type == "system_lib_string"))
+        elif node.type == "import_statement":
+            # import a, b.c as d
+            for child in node.children_by_field_name("name"):
+                # an aliased import holds the module in its own name field
+                module = child.child_by_field_name("name") if child.type == "aliased_import" else child
+                if module is not None:
+                    targets.append((module.text.decode("utf-8", errors="replace"), False))
+        else:
+            # from module import names: the module is what is imported, unless it is only dots (from . import names), when the names are
+            module = node.child_by_field_name("module_name")
+            module_text = module.text.decode("utf-8", errors="replace") if module is not None else ""
+            if module_text.strip("."):
+                targets.append((module_text, False))
+            else:
+                for child in node.children_by_field_name("name"):
+                    imported = child.child_by_field_name("name") if child.type == "aliased_import" else child
+                    if imported is not None:
+                        targets.append((imported.text.decode("utf-8", errors="replace"), False))
+        for target, is_system in targets:
+            self.repository_data.includes.append(FileInclude(self.file_path, target, is_system, line))
+
+    # record the name of the function a call node calls in the chunk that contains the call
+    def record_call(self, node: Node, chunk_id: int | None) -> None:
+        # a call outside every chunk (for example at the top of a file) belongs to no chunk
+        chunk = self.chunks_by_id.get(chunk_id) if chunk_id is not None else None
+        if chunk is None:
+            return
+        name = self.extract_called_name(node.child_by_field_name("function"))
+        if name and name not in chunk.called_names:
+            chunk.called_names.append(name)
+
+    # get the name that a call calls: the last part of a qualified or member name (ns::f, object.f, object->f)
+    def extract_called_name(self, function_node: Node | None) -> str | None:
+        current = function_node
+        while current is not None:
+            if current.type in self.identifier_nodes:
+                return current.text.decode("utf-8", errors="replace")
+            # the part after the last :: , . or ->
+            if current.type in ("qualified_identifier", "template_function"):
+                current = current.child_by_field_name("name")
+            elif current.type == "field_expression":
+                current = current.child_by_field_name("field")
+            elif current.type == "attribute":
+                current = current.child_by_field_name("attribute")
+            else:
+                # a call through something else (a lambda, a function pointer expression) has no name
+                return None
+        return None
 
     # get the name of the relevant chunk
     def extract_name(self, node: Node) -> str | None:
