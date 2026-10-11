@@ -8,13 +8,14 @@ import shlex
 from enum import Enum
 
 # Imported internal dependencies
-from code_parser import get_language, parse_source_file, chunk_repository, ChunkedRepository
+from code_parser import get_language, parse_source_file, chunk_repository, chunk_code_file, ChunkedRepository
 from model import*
 from config import *
 from code_chunker import CodeChunker, RepositoryData
 from embedder_and_retriever import Embedder, Retriever
 from context_builder import *
 from code_reviewer import review_chunks
+from doc_writer import document_chunks
 
 # Set the model now (will be loaded at a later stage)
 LOCAL_MODEL = None
@@ -77,6 +78,22 @@ def run_chat(query: str):
         print(f"\nRunning CHAT with model {LOCAL_MODEL.model_name}")
         LOCAL_MODEL.run_query_through_model(query)
 
+# Remove one pair of quotes around a typed path (shlex.split with posix=False keeps them, and a quoted path is not absolute)
+def strip_path_quotes(argument: str) -> str:
+    if len(argument) >= 2 and argument[0] == argument[-1] and argument[0] in PATH_QUOTE_CHARACTERS:
+        return argument[1:-1]
+    return argument
+
+# Put together the words of a path that has spaces in it but was typed without quotes. The target is the longest run of words from the start that is a path that exists,
+# and what is left is the markdown path. Returns None if no run of words is a path that exists.
+def join_unquoted_path(arguments: list[str]) -> list[str] | None:
+    for count in range(len(arguments), 0, -1):
+        target = " ".join(arguments[:count])
+        if Path(target).exists():
+            rest = " ".join(arguments[count:])
+            return [target, rest] if rest else [target]
+    return None
+
 # Parses paths given in DOCUMENT/REVIEW commands
 def parse_paths(command_arguments: str) -> tuple[Path, Path | None] | Exception:
     """
@@ -95,6 +112,13 @@ def parse_paths(command_arguments: str) -> tuple[Path, Path | None] | Exception:
         arguments = shlex.split(command_arguments, posix=False)
     except ValueError as e:
         return Exception(f"Unable to parse command arguments. Error: {e}")
+    # a quoted path loses its quotes
+    arguments = [strip_path_quotes(argument) for argument in arguments]
+    # more than two words may be a path with spaces that was typed without quotes
+    if len(arguments) > 2:
+        joined = join_unquoted_path(arguments)
+        if joined is not None:
+            arguments = joined
     # At least one path must be provided
     if len(arguments) == 0:
         return Exception("A target file or repository path must be provided.")
@@ -208,6 +232,22 @@ def run_review(input_str: str) -> None:
     else:
         print(f"Target path does not exist: {target_path}")
 
+# documents chunked code with the model, once there is something to document
+def document_chunked_code(target_path: Path, repository_data: RepositoryData, markdown_path: Path | None, chunked: ChunkedRepository | None = None) -> None:
+    # nothing to document (e.g. an empty file or one with no named functions, classes or constants)
+    if not repository_data.chunks and not repository_data.constants:
+        print(f"No code chunks or constants were found in {target_path}, so there is nothing to document.")
+        return
+    # we need the model before doing any expensive work
+    if LOCAL_MODEL is None:
+        print("Unable to document the code because of Error: local model uninitialised.")
+        return
+    # document the chunks (and write the markdown file if a path was given)
+    document_error = document_chunks(target_path, repository_data, LOCAL_MODEL, markdown_path, chunked)
+    # Output any exceptions
+    if isinstance(document_error, Exception):
+        print(f"Unable to document the code because of {document_error}")
+
 # creates software documentation
 def create_documentation(input_str: str) -> None:
     # Get the rest of the input after the first command
@@ -222,9 +262,36 @@ def create_documentation(input_str: str) -> None:
     # if markdown_path has nonstandard file ending we discontinue
     if markdown_path is not None:
         markdown_suffix = markdown_path.suffix
-        if markdown_suffix != ".txt" or markdown_suffix != ".md":
+        if markdown_suffix not in [".md", ".txt"]:
             print(f"Nonstandard markdown file ending. Expected '.txt' or '.md'. Instead got {markdown_suffix}")
             return
+    # Determine whether the target is a file or repository
+    if target_path.is_file():
+        print(f"Attempting to chunk and parse {target_path}.")
+        # chunk the file
+        repository_data = RepositoryData([], [])
+        chunk_error = chunk_code_file(target_path, repository_data)
+        if isinstance(chunk_error, Exception):
+            print(chunk_error)
+            return
+        print(f"Successfully chunked {len(repository_data.chunks)} chunks within {target_path}.")
+        # document the chunks
+        document_chunked_code(target_path, repository_data, markdown_path)
+    elif target_path.is_dir():
+        print(f"Attempting to chunk and parse the code files in {target_path}.")
+        # chunk every code file in the repository (a file that can not be read is noted and skipped)
+        chunked = chunk_repository(target_path)
+        if isinstance(chunked, Exception):
+            print(chunked)
+            return
+        print(f"Successfully chunked {len(chunked.repository_data.chunks)} chunks within {chunked.file_count - len(chunked.skipped_files)} of {chunked.file_count} code files.")
+        # say which files could not be read
+        for skipped_file in chunked.skipped_files:
+            print(f"Skipped {skipped_file[2:]}")
+        # document the chunks, file by file
+        document_chunked_code(target_path, chunked.repository_data, markdown_path, chunked)
+    else:
+        print(f"Target path does not exist: {target_path}")
 
 # Checks query type
 def get_query_type(input_str: str) -> QueryType:
