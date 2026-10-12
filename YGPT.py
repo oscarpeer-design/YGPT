@@ -11,8 +11,8 @@ from enum import Enum
 from code_parser import get_language, parse_source_file, chunk_repository, chunk_code_file, ChunkedRepository
 from model import*
 from config import *
-from code_chunker import CodeChunker, RepositoryData
-from embedder_and_retriever import Embedder, Retriever
+from code_chunker import CodeChunker, RepositoryData, CodeChunk
+from embedder_and_retriever import Embedder, Retriever, load_latest_index
 from context_builder import *
 from code_reviewer import review_chunks
 from doc_writer import document_chunks
@@ -21,6 +21,8 @@ from doc_writer import document_chunks
 LOCAL_MODEL = None
 # Toggle whether model is loaded/valid
 VALID_MODEL = False
+# The saved embeddings and chunks that CHAT searches (loaded when the first question is asked, then kept)
+CHAT_RETRIEVER = None
 
 # Enum for query types
 class QueryType(Enum):
@@ -40,7 +42,7 @@ def load_local_model() -> bool:
             return False
         # Initialise model class
         LOCAL_MODEL = LocalModel(model_path)
-        print("Intialised model successfully.")
+        print("Intialising model...")
     return True
 
 # Validate the local model by running a query
@@ -68,15 +70,44 @@ def load_and_validate_model() -> None:
             # determine the model is validated
             VALID_MODEL = True
 
-# CHAT command -> run chat with full system context access
+# Find the code that matches a chat question. Returns the chunks and how similar each is (both empty if there is no code to use), and says why when there is none.
+def find_chat_chunks(question: str) -> tuple[list[CodeChunk], list[float]]:
+    global CHAT_RETRIEVER
+    # load the saved embeddings and chunks the first time
+    if CHAT_RETRIEVER is None:
+        loaded = load_latest_index()
+        if isinstance(loaded, Exception):
+            print(f"{loaded} Run REVIEW on your code first so that CHAT has code to search. This answer does not use any code.")
+            return [], []
+        CHAT_RETRIEVER = loaded
+    # search for the chunks that match the question
+    failure = CHAT_RETRIEVER.retrieve(question, RETRIEVAL_RESULT_COUNT, CHAT_SIMILARITY_THRESHOLD)
+    if isinstance(failure, Exception):
+        print(f"{failure} This answer does not use any code.")
+        return [], []
+    if not CHAT_RETRIEVER.retrieved_chunks:
+        print("No saved code matched the question, so this answer does not use any code.")
+    return CHAT_RETRIEVER.retrieved_chunks, CHAT_RETRIEVER.retrieved_scores
+
+# CHAT command -> answer a question from the code that matches it
 def run_chat(query: str):
     # check validated model
     global VALID_MODEL
     global LOCAL_MODEL
     if VALID_MODEL is True and LOCAL_MODEL is not None:
-        # run chat with model
         print(f"\nRunning CHAT with model {LOCAL_MODEL.model_name}")
-        LOCAL_MODEL.run_query_through_model(query)
+        # find the code that matches the question, and build the prompt from it
+        chunks, scores = find_chat_chunks(query)
+        prompt, used_count = build_chat_prompt(query, chunks)
+        # ask the model
+        response = LOCAL_MODEL.query_model(prompt, CHAT_MAX_ANSWER_TOKENS, MODEL_TIMEOUT_SECONDS)
+        if isinstance(response, Exception) or not response.strip():
+            print(response if isinstance(response, Exception) else "The model gave an empty answer.")
+            return
+        # show the answer (an answer cut off by its length limit loses its unfinished end), then where the code came from
+        print(tidy_field(response))
+        if used_count > 0:
+            print("\n" + describe_chat_sources(chunks[:used_count], scores[:used_count]))
 
 # Remove one pair of quotes around a typed path (shlex.split with posix=False keeps them, and a quoted path is not absolute)
 def strip_path_quotes(argument: str) -> str:
@@ -330,7 +361,7 @@ def output_user_help():
     * REVIEW <absolute file path> [absolute path for markdown]: does performance and security analysis on a single code file. If a additional folder path is provided it will write the review in a markdown file. This opion requires absolute paths.
     * REVIEW <absolute repository path> [absolute path for markdown]: does performance and security analysis on a local repository. If a additional folder path is provided it will write the review in a markdown file. This opion requires absolute paths. 
 
-    * CHAT: allows chat functionality for the local model, with full access to generated system documentation. 
+    * Any other text is a CHAT question, answered from the code that REVIEW last embedded (run REVIEW on your code first). The sources of the answer are listed under it.
     
     * HELP: displays this help message.
 
