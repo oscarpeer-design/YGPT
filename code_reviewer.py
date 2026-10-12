@@ -20,8 +20,7 @@ from config import (
     REVIEW_PROGRESS_NAME_CHARS, MODEL_TIMEOUT_SECONDS, SECONDS_PER_MINUTE
 )
 from context_builder import (
-    build_chunk_review_prompt, build_review_grammar, describe_chunk_location, get_parent_chunks,
-    get_review_cache_path, load_cached_review, save_cached_review, describe_duration
+    build_chunk_review_prompt, build_review_grammar, describe_chunk_location, get_parent_chunks, describe_duration, describe_stop_reasons
 )
 from embedder_and_retriever import Embedder, Retriever
 from model import LocalModel, ReviewFinding, parse_review_findings
@@ -37,23 +36,26 @@ def build_findings_section(unit: ReviewUnit, findings: list[ReviewFinding]) -> s
     # say why this code was looked at, if we know
     reasons = f"Looked at because: {'; '.join(unit.reasons)}.\n\n" if unit.reasons else ""
     # say anything else we know about where the code is used
-    notes = "".join(f"{note}\n\n" for note in unit.notes)
+    notes = ""
+    for note in unit.notes:
+        notes += f"{note}\n\n"
     # one entry for each finding, quoting the code
-    entries = [f"- **line {finding.line}**: `{finding.code}`\n  - Problem: {finding.problem}\n  - Fix: {finding.fix}" for finding in findings]
+    entries = []
+    for finding in findings:
+        entries.append(f"- **line {finding.line}**: `{finding.code}`\n  - Problem: {finding.problem}\n  - Fix: {finding.fix}")
     return heading + reasons + notes + "\n".join(entries) + "\n"
 
 # ReviewResult: everything learned while reviewing a file piece by piece
 @dataclass
 class ReviewResult:
     unit_count: int = 0 # how many reviews were queued (a piece of code can have a security review and a performance review)
-    reviewed: int = 0 # how many were done by the model in this run
-    cached: int = 0 # how many were loaded from an earlier run
+    reviewed: int = 0 # how many were done by the model
     unflagged: int = 0 # how many chunks had no flagged lines, so there was nothing to ask the model
     failed: int = 0 # how many the model failed to do
     with_findings: int = 0 # how many reviews ended with at least one finding that checked out
     finding_count: int = 0 # how many findings checked out
     unverified: int = 0 # how many claims were thrown away: they named a line that was not flagged, argued against themselves, or only repeated the flag
-    model_seconds: float = 0.0 # time spent waiting for the model (saved reviews cost nothing)
+    model_seconds: float = 0.0 # time spent waiting for the model
     stop_reason: str = "" # why the review stopped early (empty if it did not)
     findings: list[str] = field(default_factory=list) # one markdown section for each review that has findings
     failed_notes: list[str] = field(default_factory=list) # the reviews the model failed to do
@@ -63,7 +65,6 @@ class ReviewResult:
     def add(self, other: "ReviewResult") -> None:
         self.unit_count += other.unit_count
         self.reviewed += other.reviewed
-        self.cached += other.cached
         self.unflagged += other.unflagged
         self.failed += other.failed
         self.with_findings += other.with_findings
@@ -77,13 +78,13 @@ class ReviewResult:
     # how many reviews were never reached (they are less worthwhile, so they are left for another run)
     def not_reached(self) -> int:
         # every review is either done, failed, or not reached
-        done = self.reviewed + self.cached + self.failed
+        done = self.reviewed + self.failed
         return max(0, self.unit_count - done)
 
     # describe how the review went in a few sentences
     def describe(self) -> str:
         summary = (
-            f"Did {self.reviewed + self.cached} of {self.unit_count} reviews, most worthwhile first ({self.cached} from an earlier run). "
+            f"Did {self.reviewed} of {self.unit_count} reviews, most worthwhile first. "
             f"{self.finding_count} findings (in {self.with_findings} reviews); {self.unverified} claims were thrown away (they named a line that was not flagged, argued against themselves, or only repeated the flag). "
             f"Not done: {self.not_reached()} not reached, {self.unflagged} chunks had no flagged lines, {len(self.skipped_notes)} too large to review as a whole, {self.failed} failed. "
             f"Time spent on the model: {self.model_seconds / SECONDS_PER_MINUTE:.1f} minutes."
@@ -94,7 +95,7 @@ class ReviewResult:
         if self.stop_reason:
             summary += f" The review stopped because {self.stop_reason}."
         if self.not_reached() > 0:
-            summary += " Run the same review again to continue with the remaining reviews."
+            summary += " Raise the time guideline in config.py, or review fewer files at a time, to reach the remaining reviews."
         return summary
 
 # Reviews code one piece at a time, file by file, most worthwhile first within each file, until everything is done or the time guideline is used up.
@@ -109,9 +110,14 @@ class CodeReviewer:
         # the reviews to do, most worthwhile first (only flagged lines are reviewed)
         self.plan = rank_chunks_for_review(repository_data)
         # the files, in a stable order (the order of the reviews inside each file stays most worthwhile first)
-        self.files = sorted({chunk.file_path for chunk in repository_data.chunks})
+        file_paths = set()
+        for chunk in repository_data.chunks:
+            file_paths.add(chunk.file_path)
+        self.files = sorted(file_paths)
         # the reviews of each file
-        self.units_by_file: dict[Path, list[ReviewUnit]] = {file_path: [] for file_path in self.files}
+        self.units_by_file: dict[Path, list[ReviewUnit]] = {}
+        for file_path in self.files:
+            self.units_by_file[file_path] = []
         for unit in self.plan.units:
             self.units_by_file[unit.chunk.file_path].append(unit)
         # the result of the file being reviewed (a new one is started for each file)
@@ -141,12 +147,15 @@ class CodeReviewer:
         total_budget = float(REVIEW_REPOSITORY_TIME_BUDGET_SECONDS if is_repository else REVIEW_TIME_BUDGET_SECONDS)
         file_results: list[tuple[Path, ReviewResult]] = []
         # the files that have something to review, and how long the model has been waited for so far
-        files_to_review = [file_path for file_path in self.files if self.units_by_file[file_path]]
+        files_to_review = []
+        for file_path in self.files:
+            if self.units_by_file[file_path]:
+                files_to_review.append(file_path)
         if is_repository:
             print(f"Reviewing {len(files_to_review)} of {len(self.files)} files one after another, with a guideline of {describe_duration(total_budget)} for the model in total.")
         else:
             print(f"Doing {len(self.plan.units)} reviews of flagged lines, most worthwhile first, with a guideline of {describe_duration(total_budget)} for the model.")
-        print("Press Ctrl+C to stop early: reviews already done are saved and will not be repeated next time.")
+        print("Press Ctrl+C to stop early: the report still covers the reviews already done.")
         spent = 0.0
         for file_path in self.files:
             self.result = self.start_result(file_path)
@@ -220,18 +229,8 @@ class CodeReviewer:
         prompt, related_chunks = built
         return prompt
 
-    # get the answer for a prompt: from an earlier run if there is one, otherwise from the model. Returns None if there is no answer.
+    # get the model's answer for a prompt. Returns None if there is no answer.
     def get_response(self, unit: ReviewUnit, prompt: str, grammar: str) -> str | None:
-        # reuse an earlier review of exactly this prompt if there is one (this costs no time)
-        cache_path = get_review_cache_path(self.model.model_name, prompt, grammar)
-        saved_response = load_cached_review(cache_path)
-        # a saved review we can not read is only a warning: we review again
-        if isinstance(saved_response, Exception):
-            self.say(f"Warning: {saved_response}")
-            saved_response = None
-        if saved_response is not None:
-            self.result.cached += 1
-            return saved_response
         # the time guideline is checked before each model call: everything from here on is less worthwhile and is left for another run
         if self.result.model_seconds >= self.time_budget:
             self.result.stop_reason = f"{self.time_budget_description} was reached"
@@ -243,10 +242,6 @@ class CodeReviewer:
             return None
         # the model worked, so the run of failures is over
         self.consecutive_failures = 0
-        # save the review so that the next run does not repeat it (a problem saving is only a warning)
-        saved = save_cached_review(cache_path, response)
-        if isinstance(saved, Exception):
-            self.say(f"Warning: {saved}")
         self.result.reviewed += 1
         return response
 
@@ -302,29 +297,33 @@ def total_file_results(file_results: list[tuple[Path, ReviewResult]]) -> ReviewR
 def describe_repository_review(chunked: ChunkedRepository, file_results: list[tuple[Path, ReviewResult]], max_rows: int | None) -> str:
     total = total_file_results(file_results)
     # files that had reviews queued, and files where nothing was flagged
-    reviewed_files = [item for item in file_results if item[1].unit_count > 0]
+    reviewed_files = []
+    for file_path, result in file_results:
+        if result.unit_count > 0:
+            reviewed_files.append((file_path, result))
     quiet_files = chunked.file_count - len(chunked.skipped_files) - len(reviewed_files)
     lines = [
         f"Files: {chunked.file_count} found, {len(reviewed_files)} reviewed, {quiet_files} with nothing to review, {len(chunked.skipped_files)} could not be read.",
-        f"Reviews: {total.reviewed + total.cached} done ({total.cached} from an earlier run), {total.not_reached()} not reached, {total.failed} failed.",
+        f"Reviews: {total.reviewed} done, {total.not_reached()} not reached, {total.failed} failed.",
         f"Findings: {total.finding_count} kept (in {total.with_findings} reviews), {total.unverified} claims thrown away.",
         f"Time spent on the model: {total.model_seconds / SECONDS_PER_MINUTE:.1f} minutes (guideline {describe_duration(REVIEW_REPOSITORY_TIME_BUDGET_SECONDS)})."
     ]
     # why the review stopped early, if it did
-    stop_reasons = [result.stop_reason for file_path, result in file_results if result.stop_reason]
+    stop_reasons = []
+    for file_path, result in file_results:
+        if result.stop_reason:
+            stop_reasons.append(result.stop_reason)
     if stop_reasons:
-        # each reason is said once, with the number of files it affected
-        said = [reason if stop_reasons.count(reason) == 1 else f"{reason} ({stop_reasons.count(reason)} files)" for reason in sorted(set(stop_reasons))]
-        lines.append("Stopped early: " + "; ".join(said) + ".")
+        lines.append("Stopped early: " + describe_stop_reasons(stop_reasons) + ".")
     if total.not_reached() > 0:
-        lines.append("Run the same review again to continue with the reviews that were not reached.")
+        lines.append("Raise the time guideline in config.py, or review fewer files at a time, to reach the reviews that were not reached.")
     # a table of the files with reviews: most findings first, then most reviews not reached
     if reviewed_files:
         reviewed_files.sort(key=lambda item: (-item[1].finding_count, -item[1].not_reached(), str(item[0])))
         shown = reviewed_files if max_rows is None else reviewed_files[:max_rows]
         lines.extend(["", "| File | Reviews done | Findings | Not reached |", "| --- | --- | --- | --- |"])
         for file_path, result in shown:
-            lines.append(f"| {file_path.name} | {result.reviewed + result.cached} of {result.unit_count} | {result.finding_count} | {result.not_reached()} |")
+            lines.append(f"| {file_path.name} | {result.reviewed} of {result.unit_count} | {result.finding_count} | {result.not_reached()} |")
         if len(shown) < len(reviewed_files):
             lines.append(f"| ...and {len(reviewed_files) - len(shown)} more files (all of them are in the report) | | | |")
     return "\n".join(lines)
@@ -367,7 +366,13 @@ def write_repository_report(target_path: Path, chunked: ChunkedRepository, file_
     for file_path, result in file_results:
         if result.findings or result.skipped_notes or result.failed_notes:
             # each finding's heading goes one level below the file's parts
-            deeper = ReviewResult(findings=[text.replace("### ", "#### ", 1) if text.startswith("### ") else text for text in result.findings], skipped_notes=result.skipped_notes, failed_notes=result.failed_notes)
+            deeper_findings = []
+            for text in result.findings:
+                if text.startswith("### "):
+                    deeper_findings.append(text.replace("### ", "#### ", 1))
+                else:
+                    deeper_findings.append(text)
+            deeper = ReviewResult(findings=deeper_findings, skipped_notes=result.skipped_notes, failed_notes=result.failed_notes)
             lines.extend([f"## {file_path}", ""] + build_result_sections(deeper, "###"))
     # the files that could not be read
     if chunked.skipped_files:

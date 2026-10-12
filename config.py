@@ -29,27 +29,30 @@ RETRIEVAL_SIMILARITY_THRESHOLD = 0.50 # How similar chunks should be to query
 RETRIEVAL_RELATED_CHUNK_COUNT = 2 # For each semantically retrieved chunk, how many structurally related chunks should we consider adding (connect retrieved chunks to relationships)
 RETRIEVAL_MAX_CONTEXT_CHUNKS = 10 # How many chunks to retrieve
 
-# Define different model instructions for different tasks
-# DOCUMENTATION: Used to generate markdowns describing previously unseen repositories
-DOCUMENTATION_INSTRUCTION = """
-Examine the entire codebase and document how it works. 
-Describe external dependencies and the roles of key modules. 
-Describe how various components interact together to provide required functionality. 
-Be concise.
-"""
-
-# CODE_REVIEW: Used to analyse pull requests to identify security and performance defects
-CODE_REVIEW_INSTRUCTION = """
-Conduct an advesarial review of the codebase, examining security and performance defects.
-For performance review, suggest improvements that are low-risk and do not modify existing functionality.
-For security review, list the file and line of code where a CVE occurs; describe how it can cause an exploit and suggest the simplest possible fix.
-"""
+# Define the settings for CHAT
+# How similar (cosine similarity, 0 to 1) a chunk must be to a question to be used. This is a first guess: the similarity of each source is printed under the answer so a better value can be chosen.
+CHAT_SIMILARITY_THRESHOLD = 0.30
+# The most tokens the model may use to answer a question
+CHAT_MAX_ANSWER_TOKENS = 200
+# The most tokens a chat prompt may use. The code of the best matching chunks fills what the question leaves
+CHAT_MAX_PROMPT_TOKENS = 1536
+# The longest question (in characters) that is sent to the model
+CHAT_MAX_QUESTION_CHARS = 500
+# What the model is told when code was found for the question, and when it was not
+CHAT_INSTRUCTION = "Answer the question using only the code below. If the code does not contain the answer, say so. Name the function you used. Answer in at most four sentences."
+CHAT_NO_CODE_INSTRUCTION = "Answer the question in at most four sentences. No code was found for it, so say if you are not sure."
 
 # Define parameters for the embedding model and the saved (cached) embeddings
 # Name of the sentence-transformers model that turns code chunks into vectors (also part of the cache key, so changing model never reuses old vectors)
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 # Name of the folder (created next to the code) where computed embeddings are saved so that unchanged files are not embedded again
 EMBEDDING_CACHE_FOLDER_NAME = ".embedding_cache"
+# A cache file holds two things: the vectors and the chunks they were made from (in the same order). These are the file ending and the names of the two things.
+EMBEDDING_CACHE_SUFFIX = ".npz"
+EMBEDDING_CACHE_VECTORS_KEY = "embeddings"
+EMBEDDING_CACHE_CHUNKS_KEY = "chunks"
+# A cache file is written under this mark in its name first, then swapped into place, so a half-written file is never read
+EMBEDDING_CACHE_TEMP_MARK = ".tmp"
 
 # Define parameters for the iterative, one-chunk-at-a-time code review (needed because the model is small and its context window is limited)
 # How strongly the model is discouraged from repeating words it has already written (1.0 means not at all). A small model otherwise tends to repeat a sentence until it runs out of tokens
@@ -74,7 +77,7 @@ REVIEW_RELATED_SEARCH_MULTIPLIER = 4
 # How similar (cosine similarity, 0 to 1) a chunk must be to be used as background for another chunk
 REVIEW_RELATED_SIMILARITY_THRESHOLD = 0.40
 # Guideline for the total time (in seconds) a review spends waiting for the model. It is checked before each model call, so the last call may finish after it.
-# Reviews saved from an earlier run cost no time, so running the same review again carries on where it stopped
+# A review that reaches this guideline leaves the remaining reviews undone, so raise it (or review fewer files) to reach them
 REVIEW_TIME_BUDGET_SECONDS = 300
 # The same guideline for reviewing a whole repository. Files are reviewed one after another: each file gets the time that is left divided by the number of files still to do, so time a file does not use goes to the files after it
 REVIEW_REPOSITORY_TIME_BUDGET_SECONDS = 600
@@ -117,14 +120,11 @@ SECONDS_PER_MINUTE = 60
 # Documentation uses no randomness: the model always picks its most likely wording, which invents less than a sampled one
 DOCUMENT_TEMPERATURE = 0.0
 DOCUMENT_MAX_PROMPT_TOKENS = 1024
-# Name of the folder (created next to the code) where the model's answers are saved, and a number that makes every saved answer stale when it is changed
-DOCUMENT_CACHE_FOLDER_NAME = ".documentation_cache"
-DOCUMENT_CACHE_VERSION = 2
 # How many signatures are listed for a file, and how many include arrows are drawn in the diagram of a repository
 DOCUMENT_MAX_LISTED_SYMBOLS = 30
 DOCUMENT_MAX_DIAGRAM_EDGES = 40
 # How many files are named when saying which files matter most in a repository
-DOCUMENT_MAX_CORE_FILES = 6
+DOCUMENT_MAX_CORE_FILES = 4
 # How many files are listed in the summary of documenting a repository
 DOCUMENT_SUMMARY_MAX_FILE_ROWS = 15
 
@@ -164,10 +164,6 @@ REVIEW_MIN_CALL_TIMEOUT_SECONDS = 30
 REVIEW_MAX_CONSECUTIVE_FAILURES = 3
 # How many characters of a function's name are shown in the progress bar
 REVIEW_PROGRESS_NAME_CHARS = 30
-# Name of the folder (created next to the code) where the model's review of each chunk is saved
-REVIEW_CACHE_FOLDER_NAME = ".review_cache"
-# Change this number to make every saved review stale at once (for example after changing how the model is asked)
-REVIEW_CACHE_VERSION = 1
 # A chunk of code is reviewed whole if it is no longer than this many characters. A longer chunk is reviewed in windows around its flagged lines
 REVIEW_WHOLE_CHUNK_CHARS = 1500
 # How many lines of code the model sees above and below a flagged line

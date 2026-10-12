@@ -35,26 +35,25 @@ from config import (
     DOCUMENT_MAX_DIAGRAM_EDGES, DOCUMENT_MAX_CORE_FILES, DOCUMENT_SUMMARY_MAX_FILE_ROWS, REVIEW_MAX_CONSECUTIVE_FAILURES,
     REVIEW_MIN_CALL_TIMEOUT_SECONDS, MODEL_TIMEOUT_SECONDS, REVIEW_PROGRESS_NAME_CHARS
 )
-# the prompts, the grammar and the saved answers
+# the prompts and the grammar
 from context_builder import (
     build_file_overview_prompt, build_function_documentation_prompt, build_repository_overview_prompt,
-    build_document_grammar, get_documentation_cache_path, load_cached_review, save_cached_review, describe_duration, get_answer_tokens
+    build_document_grammar, describe_duration, describe_stop_reasons, get_answer_tokens
 )
 # the model, and the function that tidies one line of its answer
 from model import LocalModel, tidy_field
 
 # The words used for a part that could not be written
-NOT_WRITTEN_TEXT = "Not written yet: the time guideline was reached or the model gave no usable answer. Run the same command again to continue."
+NOT_WRITTEN_TEXT = "Not written: the time guideline was reached or the model gave no usable answer."
 
 # DocumentationResult: how the model's part of the documentation of one file went
 @dataclass
 class DocumentationResult:
     planned: int = 0 # how many parts the model was to write (what the file is for, and what each important function does)
-    written: int = 0 # how many the model wrote in this run
-    cached: int = 0 # how many were loaded from an earlier run
+    written: int = 0 # how many the model wrote
     unusable: int = 0 # how many answers were thrown away: too short, or they copied the instructions
     failed: int = 0 # how many the model failed to write
-    model_seconds: float = 0.0 # time spent waiting for the model (saved answers cost nothing)
+    model_seconds: float = 0.0 # time spent waiting for the model
     stop_reason: str = "" # why the file was not finished (empty if it was)
 
     # add the result of another file to this one (used to total a repository)
@@ -62,7 +61,6 @@ class DocumentationResult:
         # the counts of parts are added up
         self.planned += other.planned
         self.written += other.written
-        self.cached += other.cached
         self.unusable += other.unusable
         self.failed += other.failed
         # the time is added up too
@@ -70,8 +68,8 @@ class DocumentationResult:
 
     # how many parts have no text from the model
     def not_written(self) -> int:
-        # planned parts that were neither written now nor loaded from an earlier run (never below zero)
-        return max(0, self.planned - self.written - self.cached)
+        # planned parts that were not written (never below zero)
+        return max(0, self.planned - self.written)
 
 # DocumentedFile: the facts about a file and the text the model wrote for it
 @dataclass
@@ -104,9 +102,14 @@ def copies_instruction(answer: str, instruction: str) -> bool:
     answer_words = split_words(answer)
     instruction_words = split_words(instruction)
     # every run of this many words in a row in the instruction
-    instruction_runs = {tuple(instruction_words[start:start + DOCUMENT_COPY_WORD_RUN]) for start in range(len(instruction_words) - DOCUMENT_COPY_WORD_RUN + 1)}
+    instruction_runs = set()
+    for start in range(len(instruction_words) - DOCUMENT_COPY_WORD_RUN + 1):
+        instruction_runs.add(tuple(instruction_words[start:start + DOCUMENT_COPY_WORD_RUN]))
     # the answer copied the instruction if any run of the same length in the answer is one of those
-    return any(tuple(answer_words[start:start + DOCUMENT_COPY_WORD_RUN]) in instruction_runs for start in range(len(answer_words) - DOCUMENT_COPY_WORD_RUN + 1))
+    for start in range(len(answer_words) - DOCUMENT_COPY_WORD_RUN + 1):
+        if tuple(answer_words[start:start + DOCUMENT_COPY_WORD_RUN]) in instruction_runs:
+            return True
+    return False
 
 # Remove the start of an answer that only names the function ("The function `X` builds ..." becomes "Builds ..."). The answer is left alone if nothing useful would remain.
 def strip_subject(text: str) -> str:
@@ -143,7 +146,9 @@ def finish_cut_off(text: str) -> str:
         return text
     body = text[:-len(DOCUMENT_CUT_OFF_MARK)]
     # the last place where a clause ended
-    cut = max(body.rfind(mark) for mark in DOCUMENT_CLAUSE_MARKS)
+    cut = -1
+    for mark in DOCUMENT_CLAUSE_MARKS:
+        cut = max(cut, body.rfind(mark))
     # cutting back is only worth it if enough text is left
     if cut < DOCUMENT_MIN_ANSWER_CHARS:
         return text
@@ -194,12 +199,17 @@ class DocumentationWriter:
         # in a repository some time is kept back for the overview of the whole project
         file_budget = total_budget - (DOCUMENT_REPOSITORY_OVERVIEW_RESERVE_SECONDS if is_repository else 0)
         # the files that have anything to describe (a file with no functions or classes only has its dependencies, which need no model)
-        files_to_document = [facts for facts in self.plan if facts.has_content()]
+        files_to_document = []
+        for facts in self.plan:
+            if facts.has_content():
+                files_to_document.append(facts)
         # the position of each of those files in that list (found by identity because the facts are not hashable)
-        positions = {id(facts): index for index, facts in enumerate(files_to_document)}
+        positions = {}
+        for index, facts in enumerate(files_to_document):
+            positions[id(facts)] = index
         # tell the user what is about to happen
         print(f"Documenting {len(files_to_document)} of {len(self.plan)} files one after another, with a guideline of {describe_duration(total_budget)} for the model in total.")
-        print("Press Ctrl+C to stop early: what is already written is saved and will not be written again next time.")
+        print("Press Ctrl+C to stop early: the documentation still covers what is already written.")
         # what was written for each file, and the model time used so far
         documented: list[DocumentedFile] = []
         spent = 0.0
@@ -249,14 +259,14 @@ class DocumentationWriter:
                     continue
                 # show which part is being written and how long the model has taken so far
                 progress.set_postfix_str(f"{part.name[:REVIEW_PROGRESS_NAME_CHARS]} | model {self.result.model_seconds:.0f}s")
-                # get the text (saved from an earlier run or from the model). The functions leave room for the overview.
+                # get the text from the model. The functions leave room for the overview.
                 text = self.get_text(part, 0 if is_last else REVIEW_MIN_CALL_TIMEOUT_SECONDS)
                 progress.update(1)
                 # a part with usable text is kept
                 if text:
                     part.store(text)
         except KeyboardInterrupt:
-            # Ctrl+C stops everything, and what is already saved stays saved
+            # Ctrl+C stops everything, and what is already written is kept
             self.say("\nDocumenting stopped early by the user.")
             self.abort_reason = "it was stopped by the user"
             self.result.stop_reason = self.abort_reason
@@ -296,10 +306,16 @@ class DocumentationWriter:
     # the prompt that asks what a file is for: what its main functions do (as far as that was written) and the names of everything else it defines
     def build_overview_prompt(self, document: DocumentedFile) -> str:
         facts = document.facts
-        described = [(item.chunk.chunk_name, document.function_texts[item.chunk.chunk_id]) for item in facts.important_functions if item.chunk.chunk_id in document.function_texts]
+        described = []
+        for item in facts.important_functions:
+            if item.chunk.chunk_id in document.function_texts:
+                described.append((item.chunk.chunk_name, document.function_texts[item.chunk.chunk_id]))
         # everything the file defines, once each and in source order (the model must see all of it to describe the file as a whole)
         names: list[str] = []
-        for name in [symbol.chunk_name for symbol in facts.symbols] + facts.constants:
+        for symbol in facts.symbols:
+            if symbol.chunk_name not in names:
+                names.append(symbol.chunk_name)
+        for name in facts.constants:
             if name not in names:
                 names.append(name)
         # the classes, structs and enums of the file
@@ -309,7 +325,7 @@ class DocumentationWriter:
                 types.append(symbol.chunk_name)
         return build_file_overview_prompt(facts.file_path.name, facts.language, facts.line_count, described, types, names)
 
-    # get the model's text for a part: from an earlier run if there is one, otherwise from the model. Returns "" if there is no usable text.
+    # get the model's text for a part. Returns "" if there is no usable text.
     def get_text(self, part: DocumentPart, reserve: float = 0.0) -> str:
         # the prompt is built now, because it can depend on parts written before
         prompt = part.build_prompt()
@@ -317,22 +333,6 @@ class DocumentationWriter:
         n_predict = get_answer_tokens(part.max_chars)
         # the grammar that keeps the answer to one line of the right length
         grammar = build_document_grammar(part.max_chars)
-        # reuse an earlier answer to exactly this prompt if there is one (this costs no time)
-        cache_path = get_documentation_cache_path(self.model.model_name, prompt, grammar, n_predict)
-        saved = load_cached_review(cache_path)
-        # a saved answer we can not read is only a warning: we write it again
-        if isinstance(saved, Exception):
-            self.say(f"Warning: {saved}")
-            saved = None
-        # a saved answer is checked in the same way as a new one
-        if saved is not None:
-            text = clean_answer(saved, part.instruction, part.max_sentences)
-            # count it as used from an earlier run, or as thrown away
-            if text:
-                self.result.cached += 1
-            else:
-                self.result.unusable += 1
-            return text
         # the time guideline is checked before each model call: the remaining parts are left for another run
         if self.result.model_seconds >= self.time_budget - reserve:
             self.result.stop_reason = f"{self.time_budget_description} was reached"
@@ -351,10 +351,6 @@ class DocumentationWriter:
             return ""
         # the model worked, so the run of failures is over
         self.consecutive_failures = 0
-        # save the answer so that the next run does not write it again (a problem saving is only a warning)
-        saved_result = save_cached_review(cache_path, response)
-        if isinstance(saved_result, Exception):
-            self.say(f"Warning: {saved_result}")
         # check the answer, and count it as written or thrown away
         text = clean_answer(response, part.instruction, part.max_sentences)
         if text:
@@ -380,7 +376,10 @@ class DocumentationWriter:
         # this call has its own result
         self.result = DocumentationResult()
         # one note per file whose overview was written
-        notes = [f"{document.facts.file_path.name}: {first_sentence(document.overview)}" for document in documented if document.overview]
+        notes = []
+        for document in documented:
+            if document.overview:
+                notes.append(f"{document.facts.file_path.name}: {first_sentence(document.overview)}")
         # with no notes, or after a failure that stopped everything, there is nothing to write
         if not notes or self.abort_reason:
             return "", self.result
@@ -409,7 +408,10 @@ def join_clauses(clauses: list[str]) -> str:
 def describe_implications(facts: FileFacts, is_repository: bool) -> str:
     # the files that use it
     if facts.used_by:
-        text = f"A change can affect the {len(facts.used_by)} file{'s' if len(facts.used_by) != 1 else ''} that use it ({', '.join(path.name for path in facts.used_by[:DOCUMENT_MAX_NAMED_FILES])})"
+        used_by_names = []
+        for path in facts.used_by[:DOCUMENT_MAX_NAMED_FILES]:
+            used_by_names.append(path.name)
+        text = f"A change can affect the {len(facts.used_by)} file{'s' if len(facts.used_by) != 1 else ''} that use it ({', '.join(used_by_names)})"
     elif is_repository:
         text = "No other file in the repository uses it"
     else:
@@ -436,7 +438,10 @@ def describe_dependencies(facts: FileFacts, is_repository: bool) -> str:
         clauses.append(f"{list_names(facts.external_dependencies)} {where}")
     # what it needs from inside the repository
     if facts.internal_dependencies:
-        clauses.append(f"{list_names([path.name for path in facts.internal_dependencies])} from the repository")
+        internal_names = []
+        for path in facts.internal_dependencies:
+            internal_names.append(path.name)
+        clauses.append(f"{list_names(internal_names)} from the repository")
     # headers and modules next to the file that were not among the files read
     if facts.local_dependencies:
         clauses.append(f"{list_names(facts.local_dependencies)} from the same folder")
@@ -447,7 +452,10 @@ def describe_dependencies(facts: FileFacts, is_repository: bool) -> str:
 
 # Say what a file contains in a sentence (written by code, used when the model's text is missing)
 def describe_contents(facts: FileFacts) -> str:
-    classes = sum(1 for symbol in facts.symbols if symbol.symbol_type in (SymbolType.CLASS, SymbolType.STRUCT, SymbolType.ENUM, SymbolType.NAMESPACE))
+    classes = 0
+    for symbol in facts.symbols:
+        if symbol.symbol_type in (SymbolType.CLASS, SymbolType.STRUCT, SymbolType.ENUM, SymbolType.NAMESPACE):
+            classes += 1
     # what the file defines, as far as there is anything
     items: list[str] = []
     if facts.function_count:
@@ -495,10 +503,14 @@ def build_file_section(document: DocumentedFile, shown_name: str) -> list[str]:
             lines.append(build_function_entry(item, document.function_texts.get(item.chunk.chunk_id, "")))
         lines.append("")
     # everything the file defines, by signature
-    listed = [symbol for symbol in facts.symbols if symbol.signature]
+    listed = []
+    for symbol in facts.symbols:
+        if symbol.signature:
+            listed.append(symbol)
     if listed:
         lines.extend(["**Everything it defines**", ""])
-        lines.extend(f"- `{symbol.signature}`" for symbol in listed[:DOCUMENT_MAX_LISTED_SYMBOLS])
+        for symbol in listed[:DOCUMENT_MAX_LISTED_SYMBOLS]:
+            lines.append(f"- `{symbol.signature}`")
         # say how many are left out
         if len(listed) > DOCUMENT_MAX_LISTED_SYMBOLS:
             lines.append(f"- ...and {len(listed) - DOCUMENT_MAX_LISTED_SYMBOLS} more")
@@ -506,7 +518,8 @@ def build_file_section(document: DocumentedFile, shown_name: str) -> list[str]:
     # its constants and settings, by name
     if facts.constants:
         lines.extend(["**Constants**", ""])
-        lines.extend(f"- `{name}`" for name in facts.constants[:DOCUMENT_MAX_LISTED_SYMBOLS])
+        for name in facts.constants[:DOCUMENT_MAX_LISTED_SYMBOLS]:
+            lines.append(f"- `{name}`")
         if len(facts.constants) > DOCUMENT_MAX_LISTED_SYMBOLS:
             lines.append(f"- ...and {len(facts.constants) - DOCUMENT_MAX_LISTED_SYMBOLS} more")
         lines.append("")
@@ -515,13 +528,21 @@ def build_file_section(document: DocumentedFile, shown_name: str) -> list[str]:
 # Draw which file includes or imports which, as a Mermaid diagram (an arrow means "uses")
 def build_dependency_diagram(plan: list[FileFacts]) -> list[str]:
     # one arrow for each file a file uses
-    edges = [(facts.file_path, dependency) for facts in plan for dependency in facts.internal_dependencies]
+    edges = []
+    for facts in plan:
+        for dependency in facts.internal_dependencies:
+            edges.append((facts.file_path, dependency))
     # with no arrows there is nothing to draw
     if not edges:
         return []
     # every file in an arrow gets a short id, because paths do not work as ids
-    names = sorted({path for edge in edges for path in edge})
-    ids = {path: f"f{index}" for index, path in enumerate(names)}
+    diagram_paths = set()
+    for start, end in edges:
+        diagram_paths.add(start)
+        diagram_paths.add(end)
+    ids = {}
+    for index, path in enumerate(sorted(diagram_paths)):
+        ids[path] = f"f{index}"
     lines = ["```mermaid", "graph LR"]
     # draw the arrows, up to the limit
     for start, end in edges[:DOCUMENT_MAX_DIAGRAM_EDGES]:
@@ -535,17 +556,28 @@ def build_dependency_diagram(plan: list[FileFacts]) -> list[str]:
 # Write the overview of a whole repository: the model's sentences if there are any, then what the code found out
 def build_repository_paragraph(plan: list[FileFacts], model_text: str) -> str:
     # the languages and the size of the repository
-    languages = sorted({facts.language for facts in plan if facts.has_content()})
-    lines = sum(facts.line_count for facts in plan)
-    sentences = [f"The repository has {len(plan)} code files ({', '.join(languages)}) and about {lines} lines."] if plan else []
+    language_set = set()
+    line_total = 0
+    for facts in plan:
+        if facts.has_content():
+            language_set.add(facts.language)
+        line_total += facts.line_count
+    languages = sorted(language_set)
+    sentences = [f"The repository has {len(plan)} code files ({', '.join(languages)}) and about {line_total} lines."] if plan else []
     # where it starts
     entry_points = get_entry_points(plan)
     if entry_points:
-        sentences.append(f"It starts from {', '.join(f'{name} in {path.name}' for path, name in entry_points)}.")
+        entry_texts = []
+        for path, name in entry_points:
+            entry_texts.append(f"{name} in {path.name}")
+        sentences.append(f"It starts from {', '.join(entry_texts)}.")
     # the files the others use most
     core = get_most_used_files(plan, DOCUMENT_MAX_CORE_FILES)
     if core:
-        sentences.append(f"The files that the others use most are {', '.join(f'{facts.file_path.name} (used by {len(facts.used_by)})' for facts in core)}.")
+        core_texts = []
+        for facts in core:
+            core_texts.append(f"{facts.file_path.name} (used by {len(facts.used_by)})")
+        sentences.append(f"The files that the others use most are {', '.join(core_texts)}.")
     # what it needs from outside
     external = get_repository_external_dependencies(plan)
     if external:
@@ -562,26 +594,31 @@ def describe_documentation(documented: list[DocumentedFile], repository_result: 
     if repository_result is not None:
         total.add(repository_result)
     # the files that had something for the model to describe
-    with_text = [document for document in documented if document.facts.has_content()]
+    with_text = []
+    for document in documented:
+        if document.facts.has_content():
+            with_text.append(document)
     lines = [
         f"Files: {file_count} found, {len(with_text)} documented, {len(documented) - len(with_text)} with nothing to describe, {len(skipped_files)} could not be read.",
-        f"Parts written by the model: {total.written + total.cached} of {total.planned} ({total.cached} from an earlier run), {total.not_written()} not written, {total.unusable} answers thrown away, {total.failed} failed.",
+        f"Parts written by the model: {total.written} of {total.planned}, {total.not_written()} not written, {total.unusable} answers thrown away, {total.failed} failed.",
         f"Time spent on the model: {total.model_seconds / SECONDS_PER_MINUTE:.1f} minutes (guideline {describe_duration(budget_seconds)})."
     ]
     # why anything stopped early (the same reason for many files is said once)
-    stop_reasons = [document.result.stop_reason for document in documented if document.result.stop_reason]
+    stop_reasons = []
+    for document in documented:
+        if document.result.stop_reason:
+            stop_reasons.append(document.result.stop_reason)
     if stop_reasons:
-        said = [reason if stop_reasons.count(reason) == 1 else f"{reason} ({stop_reasons.count(reason)} files)" for reason in sorted(set(stop_reasons))]
-        lines.append("Stopped early: " + "; ".join(said) + ".")
+        lines.append("Stopped early: " + describe_stop_reasons(stop_reasons) + ".")
     # tell the user how to finish what is missing
     if total.not_written() > 0:
-        lines.append("Run the same command again to write the parts that are missing.")
+        lines.append("Raise the time guideline in config.py, or document fewer files at a time, to write the parts that are missing.")
     # a table of the files with model text
     if with_text:
         shown = with_text if max_rows is None else with_text[:max_rows]
         lines.extend(["", "| File | Parts written | Not written |", "| --- | --- | --- |"])
         for document in shown:
-            lines.append(f"| {document.facts.file_path.name} | {document.result.written + document.result.cached} of {document.result.planned} | {document.result.not_written()} |")
+            lines.append(f"| {document.facts.file_path.name} | {document.result.written} of {document.result.planned} | {document.result.not_written()} |")
         # say how many rows are left out
         if len(shown) < len(with_text):
             lines.append(f"| ...and {len(with_text) - len(shown)} more files (all of them are in the documentation) | | |")
@@ -589,7 +626,9 @@ def describe_documentation(documented: list[DocumentedFile], repository_result: 
 
 # Write the whole documentation as markdown lines. For a repository, file names are shown relative to the repository folder.
 def build_documentation_markdown(target_path: Path, is_repository: bool, documented: list[DocumentedFile], repository_text: str, summary: str, skipped_files: list[str]) -> list[str]:
-    plan = [document.facts for document in documented]
+    plan = []
+    for document in documented:
+        plan.append(document.facts)
     lines = [f"# Documentation: {target_path}", ""]
     # a repository starts with its overview and a diagram of which file uses which
     if is_repository:
@@ -608,7 +647,11 @@ def build_documentation_markdown(target_path: Path, is_repository: bool, documen
             shown_name = str(document.facts.file_path)
         section = build_file_section(document, shown_name)
         # a file section is a level lower inside a repository's "Files"
-        lines.extend(f"#{line}" if is_repository and line.startswith("## ") else line for line in section)
+        for line in section:
+            if is_repository and line.startswith("## "):
+                lines.append("#" + line)
+            else:
+                lines.append(line)
     # files that could not be read
     if skipped_files:
         lines.extend(["## Files that could not be read", ""] + skipped_files + [""])
@@ -639,7 +682,9 @@ def document_chunks(target_path: Path, repository_data: RepositoryData, model: L
     repository_result: DocumentationResult | None = None
     # the overview of a whole project is written last, from what the files are for
     if is_repository:
-        spent = sum(document.result.model_seconds for document in documented)
+        spent = 0.0
+        for document in documented:
+            spent += document.result.model_seconds
         repository_text, repository_result = writer.document_repository(documented, spent, total_budget)
     # the files that could not be read, and how many files there were
     skipped_files = chunked.skipped_files if chunked is not None else []

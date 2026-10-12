@@ -3,46 +3,13 @@
 # Import external dependencies
 # dataclass, replace: used to make struct-like classes and to make edited copies of them
 from dataclasses import dataclass, replace
-# os: used to swap a finished file into place
-import os
 # Path: library used to find file paths on computer
 from pathlib import Path
 
 # Import internal dependencies
 from code_chunker import CodeChunk, RepositoryData, RelationshipType
-from code_chunk_utils import get_chunk_text, get_text_digest
+from code_chunk_utils import get_chunk_text
 from config import *
-
-# Takes a list of retrieved chunks and builds a context string from that
-def build_context(retrieved_chunks: list[CodeChunk]) -> str:
-    # Check retrived_chunks has information we need
-    if not retrieved_chunks:
-        raise ValueError(f"Expected 'retrieved_chunks' to have enough context. Instead got {retrieved_chunks}.")
-    # Initialise no context parts
-    context_parts = []
-    # Go through each retrieved chunk and get formatted chunk text
-    for chunk in retrieved_chunks:
-        context_parts.append(get_chunk_text(chunk))
-    # Return this context as a single string
-    return "\n\n".join(context_parts)
-
-
-# Builds documentation prompt from context
-def build_documentation_prompt(context: str) -> str:
-    return (
-        f"{DOCUMENTATION_INSTRUCTION}\n\n"
-        f"CODEBASE CONTEXT:\n"
-        f"{context}"
-    )
-
-# Builds review prompt from context
-def build_review_prompt(context: str) -> str:
-    return (
-        f"{CODE_REVIEW_INSTRUCTION}\n\n"
-        f"CODEBASE CONTEXT:\n"
-        f"{context}"
-    )
-
 
 # --- Reviewing a file one chunk at a time ---
 # The small model cannot read a whole file at once, so each chunk is reviewed in its own small prompt.
@@ -118,13 +85,18 @@ def build_review_header(target: CodeChunk, enclosing: CodeChunk | None) -> str:
 # Show the flagged lines by number and reason. The code of each line is already shown with its number, and repeating it would only tempt the model to copy it.
 def format_review_hints(hints: list[ReviewHint]) -> str:
     heading = "\nFLAGGED LINES (from a simple pattern search, they may be false alarms):\n"
-    hint_lines = [f"line {hint.line}: {hint.description}" for hint in hints]
+    hint_lines = []
+    for hint in hints:
+        hint_lines.append(f"line {hint.line}: {hint.description}")
     return heading + "\n".join(hint_lines) + "\n"
 
 # Show lines from elsewhere in the function that use the same names as a flagged line
 def format_context_lines(context_lines: list[ContextLine]) -> str:
     heading = "\nOTHER LINES THAT USE THE SAME NAMES (from elsewhere in the function):\n"
-    return heading + "\n".join(f"line {context.line}: {context.text}" for context in context_lines) + "\n"
+    shown_lines = []
+    for context in context_lines:
+        shown_lines.append(f"line {context.line}: {context.text}")
+    return heading + "\n".join(shown_lines) + "\n"
 
 # Build the prompt for reviewing ONE chunk, adding lines that use the same names and related chunks as background for as long as they fit.
 # Returns (prompt, the related chunks that were included), or None if the code and the flagged lines do not fit in the prompt.
@@ -212,7 +184,13 @@ def get_focus_windows(chunk: CodeChunk, focus_lines: list[int]) -> list[CodeChun
 # each naming one of the flagged lines with a reason and a fix of limited length. Naming only flagged lines means the model can not blame code that was not flagged.
 def build_review_grammar(hints: list[ReviewHint]) -> str:
     # the line numbers the model may name
-    line_choices = " | ".join(f'"{line}"' for line in sorted({hint.line for hint in hints}))
+    flagged_lines = set()
+    for hint in hints:
+        flagged_lines.add(hint.line)
+    choices = []
+    for line in sorted(flagged_lines):
+        choices.append(f'"{line}"')
+    line_choices = " | ".join(choices)
     # a finding, then up to the allowed number of further findings, nested so that each one needs the one before it
     findings = "finding" + " (finding" * (REVIEW_MAX_FINDINGS_PER_REVIEW - 1) + ")?" * (REVIEW_MAX_FINDINGS_PER_REVIEW - 1)
     # a reason or a fix is one line of limited length
@@ -237,7 +215,9 @@ def get_container_ids(repository_data: RepositoryData) -> set[int]:
 # Get the chunk that contains each chunk, as {chunk id: containing chunk}. (Chunk ids are not positions in the list of chunks, so chunks are looked up by id.)
 def get_parent_chunks(repository_data: RepositoryData) -> dict[int, CodeChunk]:
     # look chunks up by id
-    chunks_by_id = {chunk.chunk_id: chunk for chunk in repository_data.chunks}
+    chunks_by_id = {}
+    for chunk in repository_data.chunks:
+        chunks_by_id[chunk.chunk_id] = chunk
     parents = {}
     # each CONTAINS relationship says which chunk is inside which
     for relationship in repository_data.relationships:
@@ -245,37 +225,16 @@ def get_parent_chunks(repository_data: RepositoryData) -> dict[int, CodeChunk]:
             parents[relationship.end_chunk_id] = chunks_by_id[relationship.start_chunk_id]
     return parents
 
-# --- Saving reviews so that an interrupted or repeated review picks up where it left off ---
-
-# Work out where the saved review for a prompt lives. Everything that can change the model's answer is part of the name.
-def get_review_cache_path(model_name: str, prompt: str, grammar: str) -> Path:
-    # the folder sits next to this file
-    cache_folder = Path(__file__).resolve().parent / REVIEW_CACHE_FOLDER_NAME
-    # the name is a digest of the cache version, the model, its settings (including the repeat penalty), the grammar that shapes the answer and the prompt
-    digest = get_text_digest([str(REVIEW_CACHE_VERSION), model_name, str(REVIEW_N_PREDICT), str(REVIEW_REPEAT_PENALTY), str(MODEL_CTX), str(TEMPERATURE), grammar, prompt])
-    return cache_folder / f"{digest}.txt"
-
-# Load a saved review. Returns None if there is no saved review, or an Exception if it can not be read.
-def load_cached_review(cache_path: Path) -> str | None | Exception:
-    try:
-        # no saved review
-        if not cache_path.is_file():
-            return None
-        return cache_path.read_text(encoding="utf-8")
-    except Exception as e:
-        return Exception(f"Unable to read the saved review {cache_path}. Error: {e}")
-
-# Save a review. Returns None, or an Exception if it can not be saved (a failure to save must not stop a review).
-def save_cached_review(cache_path: Path, response: str) -> None | Exception:
-    try:
-        # make the folder if it does not exist yet
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        # write to a temporary file first, then swap it in, so that a half-written review is never read
-        temp_path = cache_path.with_suffix(".tmp")
-        temp_path.write_text(response, encoding="utf-8")
-        os.replace(temp_path, cache_path)
-    except Exception as e:
-        return Exception(f"Unable to save the review {cache_path}. Error: {e}")
+# Say why a run stopped early: each reason once, with the number of files it affected when it affected more than one
+def describe_stop_reasons(stop_reasons: list[str]) -> str:
+    said = []
+    for reason in sorted(set(stop_reasons)):
+        file_count = stop_reasons.count(reason)
+        if file_count == 1:
+            said.append(reason)
+        else:
+            said.append(f"{reason} ({file_count} files)")
+    return "; ".join(said)
 
 # Describe a number of seconds in plain words (e.g. "5 minute" or "90 second")
 def describe_duration(seconds: float) -> str:
@@ -304,6 +263,44 @@ def fit_code_excerpt(code: str, max_chars: int) -> str:
     # cut at the last line end that fits
     cut = code.rfind("\n", 0, max_chars)
     return code[:cut if cut > 0 else max_chars]
+
+# How many characters a chat prompt may use so that the prompt AND the model's answer both fit in the context window
+def get_chat_prompt_char_budget() -> int:
+    tokens_available = MODEL_CTX - CHAT_MAX_ANSWER_TOKENS
+    tokens_for_prompt = min(tokens_available, CHAT_MAX_PROMPT_TOKENS)
+    return int(tokens_for_prompt * CHARS_PER_TOKEN * PROMPT_SAFETY_FACTOR)
+
+# Build the prompt for a chat question: the instruction, then the best matching chunks that fit (most similar first), then the question.
+# Returns the prompt and how many of the chunks it holds (the first that many). With no chunks the prompt has no code and uses the instruction for that case.
+def build_chat_prompt(question: str, chunks: list[CodeChunk]) -> tuple[str, int]:
+    # a very long question is cut, so that it can not take all the room
+    question = question.strip()[:CHAT_MAX_QUESTION_CHARS]
+    question_text = f"QUESTION: {question}\n"
+    if not chunks:
+        return f"{CHAT_NO_CODE_INSTRUCTION}\n\n{question_text}", 0
+    prompt_start = f"{CHAT_INSTRUCTION}\n\nCODE:\n"
+    # the room left for code once the instruction and the question have theirs
+    room = get_chat_prompt_char_budget() - len(prompt_start) - len(question_text) - 1
+    code_text = ""
+    used_count = 0
+    for chunk in chunks:
+        # a heading says where the code is
+        heading = f"[{describe_chunk_location(chunk)} of {Path(chunk.file_path).name}]\n"
+        room_for_code = room - len(code_text) - len(heading) - 2
+        # the code is shortened to the room that is left, and a chunk with no room at all ends the list
+        code = fit_code_excerpt(chunk.source, room_for_code) if room_for_code > 0 else ""
+        if not code:
+            break
+        code_text += heading + code + "\n\n"
+        used_count += 1
+    return prompt_start + code_text + question_text, used_count
+
+# List where the code behind a chat answer came from (written by code, not by the model, so it can be checked). Each source shows how similar it was to the question.
+def describe_chat_sources(chunks: list[CodeChunk], scores: list[float]) -> str:
+    lines = ["Sources:"]
+    for index, chunk in enumerate(chunks):
+        lines.append(f"- {Path(chunk.file_path).name}, lines {chunk.start_line}-{chunk.end_line}: {chunk.chunk_name} (similarity {scores[index]:.2f})")
+    return "\n".join(lines)
 
 # Build the prompt that asks what a file is for and how it works. described are (name, what it does) for the functions that were already described; types are the classes, structs and enums it defines; names are everything it defines.
 def build_file_overview_prompt(file_name: str, language: str, line_count: int, described: list[tuple[str, str]], types: list[str], names: list[str]) -> str:
@@ -342,7 +339,9 @@ def build_function_documentation_prompt(file_name: str, signature: str, code: st
     # the background goes after the code, so it is first to be cut when there is no room
     background = ""
     if callee_signatures:
-        background = "\nIT CALLS (do not describe these):\n" + "".join(f"- {signature_line}\n" for signature_line in callee_signatures)
+        background = "\nIT CALLS (do not describe these):\n"
+        for signature_line in callee_signatures:
+            background += f"- {signature_line}\n"
     room_for_code = budget - len(prompt) - len("\nCODE:\n") - 1
     code_text = fit_code_excerpt(code, room_for_code)
     prompt += f"\nCODE:\n{code_text}\n"
@@ -363,9 +362,3 @@ def build_repository_overview_prompt(notes: list[str]) -> str:
 # A grammar that makes the answer one line of text of the allowed length (the model can stop as soon as it has at least the shortest length)
 def build_document_grammar(max_chars: int) -> str:
     return f"root ::= [^\\n]{{{DOCUMENT_MIN_ANSWER_CHARS},{max_chars}}}\n"
-
-# Get the path where the model's answer to a documentation prompt is saved. The name is a digest of everything that shapes the answer.
-def get_documentation_cache_path(model_name: str, prompt: str, grammar: str, n_predict: int) -> Path:
-    cache_folder = Path(__file__).resolve().parent / DOCUMENT_CACHE_FOLDER_NAME
-    digest = get_text_digest([str(DOCUMENT_CACHE_VERSION), model_name, str(n_predict), str(DOCUMENT_REPEAT_PENALTY), str(MODEL_CTX), str(DOCUMENT_TEMPERATURE), grammar, prompt])
-    return cache_folder / f"{digest}.txt"

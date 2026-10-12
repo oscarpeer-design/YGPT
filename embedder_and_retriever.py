@@ -9,14 +9,16 @@ import faiss
 import numpy as np
 # dataclass: used to create struct-like classes
 from dataclasses import dataclass
+# json: used to save the chunks as text inside the cache file
+import json
 # os: used to swap a finished file into place
 import os
 # Path: library used to find file paths on computer
 from pathlib import Path
 
 # Import Internal Depenencies
-from code_chunker import RepositoryData, CodeChunk
-from config import RETRIEVAL_RESULT_COUNT, RETRIEVAL_SIMILARITY_THRESHOLD, EMBEDDING_MODEL_NAME, EMBEDDING_CACHE_FOLDER_NAME, REVIEW_RELATED_SEARCH_MULTIPLIER
+from code_chunker import RepositoryData, CodeChunk, SymbolType
+from config import RETRIEVAL_RESULT_COUNT, RETRIEVAL_SIMILARITY_THRESHOLD, EMBEDDING_MODEL_NAME, EMBEDDING_CACHE_FOLDER_NAME, REVIEW_RELATED_SEARCH_MULTIPLIER, EMBEDDING_CACHE_SUFFIX, EMBEDDING_CACHE_VECTORS_KEY, EMBEDDING_CACHE_CHUNKS_KEY, EMBEDDING_CACHE_TEMP_MARK
 from code_chunk_utils import get_chunk_text, get_text_digest
 
 # EmbeddingState: state of shared vector embeddings used in retrieval and embedding creation
@@ -53,7 +55,38 @@ def get_embedding_cache_path(chunk_texts: list[str]) -> Path:
     cache_folder = Path(__file__).resolve().parent / EMBEDDING_CACHE_FOLDER_NAME
     # the name is a digest of the model name followed by every chunk text, in order
     digest = get_text_digest([EMBEDDING_MODEL_NAME] + chunk_texts)
-    return cache_folder / f"{digest}.npy"
+    return cache_folder / f"{digest}{EMBEDDING_CACHE_SUFFIX}"
+
+# Turn a chunk into a plain record that can be saved as text. The record keeps what CHAT needs to show the chunk again (its code, where it is and what it is called).
+def chunk_to_record(chunk: CodeChunk) -> dict:
+    return {
+        "chunk_id": chunk.chunk_id,
+        "chunk_name": chunk.chunk_name,
+        "source": chunk.source,
+        "file_path": str(chunk.file_path),
+        "language": chunk.language,
+        "symbol_type": chunk.symbol_type.value,
+        "start_line": chunk.start_line,
+        "end_line": chunk.end_line,
+        "signature": chunk.signature
+    }
+
+# Turn a saved record back into a chunk. Returns an Exception if the record is damaged.
+def record_to_chunk(record: dict) -> CodeChunk | Exception:
+    try:
+        return CodeChunk(
+            chunk_id=record["chunk_id"],
+            chunk_name=record["chunk_name"],
+            source=record["source"],
+            file_path=Path(record["file_path"]),
+            language=record["language"],
+            symbol_type=SymbolType(record["symbol_type"]),
+            start_line=record["start_line"],
+            end_line=record["end_line"],
+            signature=record["signature"]
+        )
+    except Exception as e:
+        return Exception(f"A saved chunk is damaged. Error: {e}")
 
 # Load saved embeddings. Returns None if there are none, or an Exception if they can not be read.
 def load_cached_embeddings(cache_path: Path, expected_count: int) -> np.ndarray | None | Exception:
@@ -61,7 +94,9 @@ def load_cached_embeddings(cache_path: Path, expected_count: int) -> np.ndarray 
         # no saved embeddings
         if not cache_path.is_file():
             return None
-        embeddings = np.load(cache_path)
+        # the cache file holds the vectors and the chunks they were made from, and only the vectors are needed here
+        with np.load(cache_path) as saved_file:
+            embeddings = saved_file[EMBEDDING_CACHE_VECTORS_KEY]
         # check that the saved embeddings match the chunks we have
         if embeddings.ndim != 2 or embeddings.shape[0] != expected_count:
             return Exception(f"The saved embeddings {cache_path} do not match the chunks, so they will not be used.")
@@ -70,14 +105,19 @@ def load_cached_embeddings(cache_path: Path, expected_count: int) -> np.ndarray 
     except Exception as e:
         return Exception(f"Unable to read the saved embeddings {cache_path}. Error: {e}")
 
-# Save embeddings. Returns None, or an Exception if they can not be saved (a failure to save must not stop a review).
-def save_cached_embeddings(cache_path: Path, embeddings: np.ndarray) -> None | Exception:
+# Save embeddings together with the chunks they were made from (row i of the embeddings is chunk i). Returns None, or an Exception if they can not be saved (a failure to save must not stop a review).
+def save_cached_embeddings(cache_path: Path, embeddings: np.ndarray, chunks: list[CodeChunk]) -> None | Exception:
     try:
         # make the folder if it does not exist yet
         cache_path.parent.mkdir(parents=True, exist_ok=True)
+        # turn every chunk into a record, in order, and write them all as one piece of text
+        records = []
+        for chunk in chunks:
+            records.append(chunk_to_record(chunk))
+        chunks_text = json.dumps(records)
         # write to a temporary file first, then swap it in, so that a half-written file is never read
-        temp_path = cache_path.with_name(cache_path.stem + ".tmp.npy")
-        np.save(temp_path, embeddings)
+        temp_path = cache_path.with_name(cache_path.stem + EMBEDDING_CACHE_TEMP_MARK + EMBEDDING_CACHE_SUFFIX)
+        np.savez_compressed(temp_path, **{EMBEDDING_CACHE_VECTORS_KEY: embeddings, EMBEDDING_CACHE_CHUNKS_KEY: np.array(chunks_text)})
         os.replace(temp_path, cache_path)
     except Exception as e:
         return Exception(f"Unable to save the embeddings {cache_path}. Error: {e}")
@@ -121,7 +161,7 @@ class Embedder:
             # FAISS needs contiguous float32 vectors
             embeddings = np.ascontiguousarray(embeddings, dtype=np.float32)
             # save the embeddings for next time (a problem saving is only a warning)
-            saved = save_cached_embeddings(cache_path, embeddings)
+            saved = save_cached_embeddings(cache_path, embeddings, self.chunks)
             if isinstance(saved, Exception):
                 print(f"Warning: {saved}")
         else:
@@ -143,15 +183,18 @@ class Retriever:
         self.all_chunks = all_chunks
         # all the chunks retrieved by a query
         self.retrieved_chunks: list[CodeChunk] = []
+        # how similar each retrieved chunk was to the query, in the same order as the retrieved chunks
+        self.retrieved_scores: list[float] = []
         # State of embeddings
         self.embedding_state = embedding_state
 
     # clear retrieved chunks list inbetween queries
     def clear_retrieval(self) -> None:
         self.retrieved_chunks = []
+        self.retrieved_scores = []
 
-    # Retrieve chunks based on whatever is most semantically relevant to the passed query
-    def retrieve(self, query: str, result_count: int = RETRIEVAL_RESULT_COUNT, similarity_threshold: float = RETRIEVAL_SIMILARITY_THRESHOLD) -> None:
+    # Retrieve chunks based on whatever is most semantically relevant to the passed query. Returns None, or an Exception if the query could not be searched.
+    def retrieve(self, query: str, result_count: int = RETRIEVAL_RESULT_COUNT, similarity_threshold: float = RETRIEVAL_SIMILARITY_THRESHOLD) -> None | Exception:
         # clear retrieved chunks
         self.clear_retrieval()
 
@@ -159,14 +202,14 @@ class Retriever:
         try:
             query_embedding = get_embedding_model().encode([query], normalize_embeddings=True)
         except Exception as e:
-            raise RuntimeError(f"Failed to encode query: {str(e)}")
+            return Exception(f"Failed to encode query: {str(e)}")
 
         # get distances and indices. Note that retrieval can be corrupted
         try:
             distances, indices = self.embedding_state.vector_index.search(query_embedding, result_count)
         except Exception as e:
-            raise RuntimeError(f"FAISS search failed: {str(e)}")
-        # Search the FAISS index for the closest chunk embeddings.
+            return Exception(f"FAISS search failed: {str(e)}")
+        # Go through the closest chunk embeddings.
         for distance, index in zip(distances[0], indices[0]):
             # If index = -1, there is no embedding
             if index == -1:
@@ -180,6 +223,7 @@ class Retriever:
             # Try to retrieve specific chunk (handle out of bounds access)
             try:
                 self.retrieved_chunks.append(self.all_chunks[index])
+                self.retrieved_scores.append(float(distance))
             except IndexError:
                 print(f"Warning: Index {index} out of bounds for chunks list (size: {len(self.all_chunks)})")
             
@@ -220,3 +264,45 @@ class Retriever:
             if len(related) >= candidate_count:
                 break
         return related
+
+# Load the newest saved embeddings together with the chunks they were made from, and build a retriever from them (used by CHAT, which is not given any paths).
+# Returns an Exception if there is nothing saved, or what is saved can not be used.
+def load_latest_index() -> Retriever | Exception:
+    try:
+        # the folder where embeddings are saved
+        cache_folder = Path(__file__).resolve().parent / EMBEDDING_CACHE_FOLDER_NAME
+        if not cache_folder.is_dir():
+            return Exception("No saved embeddings were found.")
+        # find the newest finished cache file (a file still being written has the temporary mark in its name)
+        newest_path = None
+        newest_time = 0.0
+        for path in cache_folder.glob("*" + EMBEDDING_CACHE_SUFFIX):
+            if path.stem.endswith(EMBEDDING_CACHE_TEMP_MARK):
+                continue
+            modified_time = path.stat().st_mtime
+            if newest_path is None or modified_time > newest_time:
+                newest_path = path
+                newest_time = modified_time
+        if newest_path is None:
+            return Exception("No saved embeddings were found.")
+        # read the vectors and the chunks from the file
+        with np.load(newest_path) as saved_file:
+            embeddings = saved_file[EMBEDDING_CACHE_VECTORS_KEY]
+            chunks_text = saved_file[EMBEDDING_CACHE_CHUNKS_KEY].item()
+        # turn every record back into a chunk, in order
+        chunks = []
+        for record in json.loads(chunks_text):
+            chunk = record_to_chunk(record)
+            if isinstance(chunk, Exception):
+                return chunk
+            chunks.append(chunk)
+        # row i of the vectors must be chunk i, so there must be one of each
+        if embeddings.ndim != 2 or embeddings.shape[0] != len(chunks):
+            return Exception(f"The saved embeddings {newest_path} do not match their chunks, so they will not be used.")
+        # build the search index from the vectors (FAISS needs contiguous float32 vectors)
+        embeddings = np.ascontiguousarray(embeddings, dtype=np.float32)
+        vector_index = faiss.IndexFlatIP(embeddings.shape[1])
+        vector_index.add(embeddings)
+        return Retriever(chunks, EmbeddingState(embeddings=embeddings, vector_index=vector_index))
+    except Exception as e:
+        return Exception(f"Unable to read the saved embeddings. Error: {e}")
