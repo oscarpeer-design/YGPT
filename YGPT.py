@@ -42,7 +42,7 @@ def load_local_model() -> bool:
             return False
         # Initialise model class
         LOCAL_MODEL = LocalModel(model_path)
-        print("Intialising model...")
+        print("Intialised model successfully.")
     return True
 
 # Validate the local model by running a query
@@ -86,7 +86,7 @@ def find_chat_chunks(question: str) -> tuple[list[CodeChunk], list[float]]:
         print(f"{failure} This answer does not use any code.")
         return [], []
     if not CHAT_RETRIEVER.retrieved_chunks:
-        print("No saved code matched the question, so this answer does not use any code.")
+        print("No saved code matched the question, so this answer does not use any code.\n")
     return CHAT_RETRIEVER.retrieved_chunks, CHAT_RETRIEVER.retrieved_scores
 
 # CHAT command -> answer a question from the code that matches it
@@ -100,7 +100,7 @@ def run_chat(query: str):
         chunks, scores = find_chat_chunks(query)
         prompt, used_count = build_chat_prompt(query, chunks)
         # ask the model
-        response = LOCAL_MODEL.query_model(prompt, CHAT_MAX_ANSWER_TOKENS, MODEL_TIMEOUT_SECONDS)
+        response = LOCAL_MODEL.query_model(prompt, CHAT_MAX_ANSWER_TOKENS, MODEL_TIMEOUT_SECONDS, None, CHAT_REPEAT_PENALTY, CHAT_TEMPERATURE)
         if isinstance(response, Exception) or not response.strip():
             print(response if isinstance(response, Exception) else "The model gave an empty answer.")
             return
