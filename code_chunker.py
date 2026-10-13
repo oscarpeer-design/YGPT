@@ -257,12 +257,24 @@ class CodeChunker:
                 if not parent_stack:
                     return
 
+    # say whether a C++ function definition has a parameter list: its declarator, followed through any pointer or reference, ends in a function declarator
+    def has_parameter_list(self, node: Node) -> bool:
+        declarator = node.child_by_field_name("declarator")
+        while declarator is not None:
+            if declarator.type == "function_declarator":
+                return True
+            declarator = declarator.child_by_field_name("declarator")
+        return False
+
     # classify node and add its discovered variant
     def discover_node(self, node: Node, parent_chunk_id: int | None) -> DiscoveredNode | None:
         # get node type
         symbol_type = self.independent_specifiers.get(node.type)
         # for a function with a parent id, it is a method: otherwise it is a single function
         if node.type == "function_definition":
+            # a C++ function has a parameter list. A "function" without one is code the parser misread (for example a namespace wrapped in macros), so it is not a chunk (the code inside it is still walked)
+            if self.language_used == LANGUAGE_CPP and not self.has_parameter_list(node):
+                return None
             if parent_chunk_id is not None:
                 symbol_type = SymbolType.METHOD
             else:

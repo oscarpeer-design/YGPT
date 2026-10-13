@@ -281,12 +281,16 @@ def build_chat_prompt(question: str, chunks: list[CodeChunk]) -> tuple[str, int]
     prompt_start = f"{CHAT_INSTRUCTION}\n\nCODE:\n"
     # the room left for code once the instruction and the question have theirs
     room = get_chat_prompt_char_budget() - len(prompt_start) - len(question_text) - 1
+    # each chunk may use only its share of the room (one chunk alone may use all of it)
+    share = room // max(1, min(len(chunks), CHAT_CHUNKS_PER_PROMPT))
     code_text = ""
     used_count = 0
     for chunk in chunks:
         # a heading says where the code is
         heading = f"[{describe_chunk_location(chunk)} of {Path(chunk.file_path).name}]\n"
-        room_for_code = room - len(code_text) - len(heading) - 2
+        # the room that is left, and the room this chunk's share allows (the smaller of the two)
+        room_left = room - len(code_text) - len(heading) - 2
+        room_for_code = min(room_left, share - len(heading) - 2)
         # the code is shortened to the room that is left, and a chunk with no room at all ends the list
         code = fit_code_excerpt(chunk.source, room_for_code) if room_for_code > 0 else ""
         if not code:

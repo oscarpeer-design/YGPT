@@ -27,7 +27,7 @@ from code_chunker import RepositoryData, SymbolType
 from code_parser import ChunkedRepository
 # the settings: time guidelines, answer lengths, instructions and limits
 from config import (
-    DOCUMENT_TIME_BUDGET_SECONDS, DOCUMENT_REPOSITORY_TIME_BUDGET_SECONDS, DOCUMENT_REPOSITORY_OVERVIEW_RESERVE_SECONDS,
+    DOCUMENT_TIME_BUDGET_SECONDS, DOCUMENT_REPOSITORY_TIME_BUDGET_SECONDS, DOCUMENT_REPOSITORY_OVERVIEW_RESERVE_SECONDS, DOCUMENT_OVERVIEW_RESERVE_SECONDS,
     DOCUMENT_OVERVIEW_MAX_CHARS, DOCUMENT_FUNCTION_MAX_CHARS, DOCUMENT_REPOSITORY_MAX_CHARS,
     DOCUMENT_OVERVIEW_INSTRUCTION, DOCUMENT_FUNCTION_INSTRUCTION, DOCUMENT_SUBJECT_PATTERN, DOCUMENT_FRAGMENT_START_PATTERN, DOCUMENT_CUT_OFF_MARK, DOCUMENT_CLAUSE_MARKS,
     DOCUMENT_FUNCTION_EXAMPLE, DOCUMENT_REPOSITORY_INSTRUCTION, DOCUMENT_OVERVIEW_SENTENCES, DOCUMENT_FUNCTION_SENTENCES, DOCUMENT_REPOSITORY_SENTENCES,
@@ -260,7 +260,7 @@ class DocumentationWriter:
                 # show which part is being written and how long the model has taken so far
                 progress.set_postfix_str(f"{part.name[:REVIEW_PROGRESS_NAME_CHARS]} | model {self.result.model_seconds:.0f}s")
                 # get the text from the model. The functions leave room for the overview.
-                text = self.get_text(part, 0 if is_last else REVIEW_MIN_CALL_TIMEOUT_SECONDS)
+                text = self.get_text(part, 0 if is_last else DOCUMENT_OVERVIEW_RESERVE_SECONDS)
                 progress.update(1)
                 # a part with usable text is kept
                 if text:

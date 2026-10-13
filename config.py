@@ -32,15 +32,20 @@ RETRIEVAL_MAX_CONTEXT_CHUNKS = 10 # How many chunks to retrieve
 # Define the settings for CHAT
 # How similar (cosine similarity, 0 to 1) a chunk must be to a question to be used. This is a first guess: the similarity of each source is printed under the answer so a better value can be chosen.
 CHAT_SIMILARITY_THRESHOLD = 0.30
-# The most tokens the model may use to answer a question
-CHAT_MAX_ANSWER_TOKENS = 200
+# The most tokens the model may use to answer a question. This is only a safety net against a model that never stops: an answer normally ends by itself well before it. The prompt keeps its own room (CHAT_MAX_PROMPT_TOKENS), so a larger value here does not shrink the code the model is shown
+CHAT_MAX_ANSWER_TOKENS = 1024
 # The most tokens a chat prompt may use. The code of the best matching chunks fills what the question leaves
 CHAT_MAX_PROMPT_TOKENS = 1536
 # The longest question (in characters) that is sent to the model
 CHAT_MAX_QUESTION_CHARS = 500
+# The room for code in a chat prompt is shared between the chunks found, so that one large chunk can not crowd out the rest. This is the most chunks it is shared between (one chunk alone may use all of it)
+CHAT_CHUNKS_PER_PROMPT = 3
+# The model is discouraged from repeating itself (above 1.0), and picks its most likely wording (temperature 0)
+CHAT_REPEAT_PENALTY = 1.1
+CHAT_TEMPERATURE = 0.0
 # What the model is told when code was found for the question, and when it was not
-CHAT_INSTRUCTION = "Answer the question using only the code below. If the code does not contain the answer, say so. Name the function you used. Answer in at most four sentences."
-CHAT_NO_CODE_INSTRUCTION = "Answer the question in at most four sentences. No code was found for it, so say if you are not sure."
+CHAT_INSTRUCTION = "Answer the question using only the code below. If the code does not contain the answer, say so. Name the function you used."
+CHAT_NO_CODE_INSTRUCTION = "Answer the question. No code was found for it, so say if you are not sure."
 
 # Define parameters for the embedding model and the saved (cached) embeddings
 # Name of the sentence-transformers model that turns code chunks into vectors (also part of the cache key, so changing model never reuses old vectors)
@@ -78,15 +83,15 @@ REVIEW_RELATED_SEARCH_MULTIPLIER = 4
 REVIEW_RELATED_SIMILARITY_THRESHOLD = 0.40
 # Guideline for the total time (in seconds) a review spends waiting for the model. It is checked before each model call, so the last call may finish after it.
 # A review that reaches this guideline leaves the remaining reviews undone, so raise it (or review fewer files) to reach them
-REVIEW_TIME_BUDGET_SECONDS = 300
+REVIEW_TIME_BUDGET_SECONDS = 600
 # The same guideline for reviewing a whole repository. Files are reviewed one after another: each file gets the time that is left divided by the number of files still to do, so time a file does not use goes to the files after it
-REVIEW_REPOSITORY_TIME_BUDGET_SECONDS = 600
+REVIEW_REPOSITORY_TIME_BUDGET_SECONDS = 1200
 # How many files the summary of a repository review lists (the report lists all of them)
 REVIEW_SUMMARY_MAX_FILE_ROWS = 15
 
 # Define parameters for documenting code (the DOCUMENT command)
 # How many functions of each file are documented one by one (the most important ones; the rest are only listed by signature)
-DOCUMENT_FUNCTIONS_PER_FILE = 3
+DOCUMENT_FUNCTIONS_PER_FILE = 6
 # How many signatures of the functions that an important function calls are shown to the model as background
 DOCUMENT_MAX_CALLEE_SIGNATURES = 4
 # How many callers are named when saying where an important function is called from
@@ -96,6 +101,8 @@ DOCUMENT_TIME_BUDGET_SECONDS = 300
 DOCUMENT_REPOSITORY_TIME_BUDGET_SECONDS = 600
 # Time (in seconds) kept back from the files for the overview of a whole repository, which is written last
 DOCUMENT_REPOSITORY_OVERVIEW_RESERVE_SECONDS = 30
+# Time (in seconds) each file keeps back for its own overview, which is written after its functions. The functions of a file stop when its share of the time has only this much left (time the overview does not use goes to the files after it)
+DOCUMENT_OVERVIEW_RESERVE_SECONDS = 30
 # The most characters the model may write for each part of the documentation (a part that reaches this length is cut back to its last whole sentence)
 DOCUMENT_OVERVIEW_MAX_CHARS = 450
 DOCUMENT_FUNCTION_MAX_CHARS = 300
