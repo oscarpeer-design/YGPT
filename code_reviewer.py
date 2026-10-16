@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 # time: used to measure how long the model takes
 import time
-# tqdm: draws the progress bar (it is installed along with sentence-transformers)
+# tqdm: draws the progress bar (installed with pip, together with the other dependencies)
 from tqdm import tqdm
 
 # Import Internal Depenencies

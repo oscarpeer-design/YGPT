@@ -48,8 +48,13 @@ CHAT_INSTRUCTION = "Answer the question using only the code below. If the code d
 CHAT_NO_CODE_INSTRUCTION = "Answer the question. No code was found for it, so say if you are not sure."
 
 # Define parameters for the embedding model and the saved (cached) embeddings
-# Name of the sentence-transformers model that turns code chunks into vectors (also part of the cache key, so changing model never reuses old vectors)
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+# Name of the model that turns code chunks into vectors (also part of the cache key, so changing model never reuses old vectors)
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2-onnx-fp32"
+# The two files of that model, kept next to the code: the model itself (ONNX format) and the tokenizer that cuts text into the pieces it reads
+EMBEDDING_MODEL_FILE_NAME = "model.onnx"
+EMBEDDING_TOKENIZER_FILE_NAME = "tokenizer.json"
+# The most pieces (tokens) of a chunk the model reads. MiniLM reads 256, so the rest of a longer chunk is not part of its vector
+EMBEDDING_MAX_TOKENS = 256
 # Name of the folder (created next to the code) where computed embeddings are saved so that unchanged files are not embedded again
 EMBEDDING_CACHE_FOLDER_NAME = ".embedding_cache"
 # A cache file holds two things: the vectors and the chunks they were made from (in the same order). These are the file ending and the names of the two things.
@@ -83,9 +88,9 @@ REVIEW_RELATED_SEARCH_MULTIPLIER = 4
 REVIEW_RELATED_SIMILARITY_THRESHOLD = 0.40
 # Guideline for the total time (in seconds) a review spends waiting for the model. It is checked before each model call, so the last call may finish after it.
 # A review that reaches this guideline leaves the remaining reviews undone, so raise it (or review fewer files) to reach them
-REVIEW_TIME_BUDGET_SECONDS = 600
+REVIEW_TIME_BUDGET_SECONDS = 300
 # The same guideline for reviewing a whole repository. Files are reviewed one after another: each file gets the time that is left divided by the number of files still to do, so time a file does not use goes to the files after it
-REVIEW_REPOSITORY_TIME_BUDGET_SECONDS = 1200
+REVIEW_REPOSITORY_TIME_BUDGET_SECONDS = 900
 # How many files the summary of a repository review lists (the report lists all of them)
 REVIEW_SUMMARY_MAX_FILE_ROWS = 15
 

@@ -13,7 +13,7 @@ from typing import Callable
 import re
 # time: used to measure how long the model takes
 import time
-# tqdm: draws the progress bar (it is installed along with sentence-transformers)
+# tqdm: draws the progress bar (installed with pip, together with the other dependencies)
 from tqdm import tqdm
 
 # Import Internal Depenencies
@@ -486,7 +486,7 @@ def build_function_entry(item: ImportantFunction, text: str) -> str:
     # the functions it calls are found by code, so they show whether the sentence above matches the code
     if item.callee_names:
         entry += f"\n  - Calls: {', '.join(item.callee_names)}"
-    return entry + f"\n  - Why it matters: {why}"
+    return entry + f"\n  - What this funtcion affects: {why}"
 
 # Write the documentation of one file as markdown
 def build_file_section(document: DocumentedFile, shown_name: str) -> list[str]:
