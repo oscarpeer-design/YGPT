@@ -42,7 +42,7 @@ def load_local_model() -> bool:
             return False
         # Initialise model class
         LOCAL_MODEL = LocalModel(model_path)
-        print("Intialised model successfully.")
+        print("Intialising model...")
     return True
 
 # Validate the local model by running a query

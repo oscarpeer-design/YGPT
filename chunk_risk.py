@@ -22,29 +22,20 @@ from config import (
 # Each signal is (points, description, regular expression): a line is flagged if the expression matches it (comments removed), and the points rank the review
 CPP_RISK_SIGNALS = [
     (3, "raw memory/C-string calls", r"\b(memcpy|memmove|memset|strcpy|strncpy|strcat|strncat|sprintf|vsprintf|gets|alloca|malloc|calloc|realloc|free)\s*\("),
-    (3, "runs files/processes", r"\b(system|popen|execv\w*|execl\w*|fopen|CreateProcess\w*)\s*\("),
+    (3, "runs processes", r"\b(system|popen|execv\w*|execl\w*|CreateProcess\w*)\s*\("),
     (2, "parses numbers from text", r"\b(strtod|strtof|strtold|strtoll|strtoull|strtol|strtoul|atoi|atol|atof|stoi|stol|stoul|stoll|stoull|stod|stof)\s*\("),
     (2, "unsafe casts", r"\b(reinterpret_cast|const_cast)\b"),
-    (2, "allocation sized by data", r"\.(resize|reserve)\s*\(|\bnew\s+[\w:<>]+\s*\["),
-    (1, "narrowing casts", r"static_cast\s*<\s*(unsigned\s+)?(char|short|int|std::u?int(8|16|32)_t)\s*>"),
-    (1, "assert is the only check", r"\bassert\s*\("),
-    (1, "indexes with a variable", r"\w\s*\[\s*[A-Za-z_][^\]\n]*\]"),
-    (1, "union / launder", r"\b(union|std::launder)\b"),
+    (2, "allocation sized by data", r"\bnew\s+[\w:<>]+\s*\["),
 ]
 PYTHON_RISK_SIGNALS = [
-    (4, "runs dynamic code", r"\b(eval|exec|compile|__import__)\s*\("),
+    (4, "runs dynamic code", r"\b(eval|exec|__import__)\s*\("),
     (4, "runs shell commands", r"\bos\.(system|popen)\s*\(|shell\s*=\s*True"),
     (4, "unsafe deserialisation", r"\b(pickle|cPickle|marshal|shelve|dill)\.loads?\s*\(|\byaml\.load\s*\("),
-    (3, "extracts archives", r"\.(extractall|extract)\s*\("),
+    (3, "extracts archives", r"\.extractall\s*\("),
     (3, "disables TLS checks", r"verify\s*=\s*False"),
     (3, "builds SQL from strings", r"\.execute\s*\(\s*(f[\"']|[\"'][^\"']*[\"']\s*(%|\+|\.format))"),
     (3, "insecure temp file", r"\bmktemp\s*\("),
     (2, "runs processes", r"\bsubprocess\.\w+\s*\("),
-    (1, "opens files", r"\bopen\s*\("),
-    (1, "network access", r"\b(socket|requests|urllib|http\.client)\b"),
-    (1, "weak hash/random", r"\b(md5|sha1)\s*\(|\brandom\.(random|randint|choice)\s*\("),
-    (1, "assert is the only check", r"(?m)^\s*assert\b"),
-    (1, "swallows exceptions", r"(?m)except\s*(Exception)?\s*:\s*(pass)?\s*$"),
 ]
 # Points added when a function calls itself (hostile input can make it recurse without limit)
 RISK_POINTS_RECURSION = 2
@@ -66,26 +57,20 @@ RISK_MANY_BRANCHES = 20
 CPP_PERFORMANCE_SIGNALS = [
     (3, "allocates memory on every loop iteration", r"\bnew\s+\w|\bstd::make_(unique|shared)\s*<", "loop", None),
     (3, "builds a regex or string stream inside a loop", r"\bstd::(regex|stringstream|ostringstream|istringstream)\b", "loop", None),
-    (3, "searches linearly inside a loop (may be O(n^2))", r"\bstd::(find|find_if|count|count_if|search)\s*\(|\.(insert|erase)\s*\([^;]*\.begin\s*\(\)", "loop", None),
+    (3, "searches linearly inside a loop (may be O(n^2))", r"\bstd::(find|find_if|count|count_if|search)\s*\(", "loop", None),
     (2, "string length recomputed inside a loop", r"\bstrlen\s*\(", "loop", None),
-    (2, "grows a container in a loop without reserving space", r"\.(push_back|emplace_back)\s*\(", "loop", r"\.reserve\s*\("),
+    (2, "loop with no exit condition", r"\bfor\s*\(\s*;\s*;\s*\)|\bwhile\s*\(\s*(true|1)\s*\)", "anywhere", None),
+    (2, "grows a container in a loop without reserving space", r"(?<!\])\.(push_back|emplace_back)\s*\(", "loop", r"\.reserve\s*\("),
     (2, "builds a new container or string on every loop iteration", r"^\s*(const\s+)?std::(string|vector<[^;]*>|map<[^;]*>|unordered_map<[^;]*>|set<[^;]*>|unordered_set<[^;]*>|deque<[^;]*>|list<[^;]*>)\s+\w+\s*(=|\(|\{|;)", "loop", None),
-    (1, "flushes output on every loop iteration", r"\bstd::endl\b", "loop", None),
-    (2, "passes a large container by value (a copy is made)", r"\bstd::(string|vector|map|unordered_map|set|unordered_set|deque|list)\b(<[^()]*>)?\s+\w+\s*[,)]", "signature", None),
 ]
 PYTHON_PERFORMANCE_SIGNALS = [
     (3, "runs a query or request inside a loop", r"\.(execute|executemany|fetchone|fetchall)\s*\(|\brequests\.\w+\s*\(|\burlopen\s*\(", "loop", None),
     (3, "opens or reads a file inside a loop", r"\bopen\s*\(|\.read_text\s*\(|\.read_bytes\s*\(", "loop", None),
     (3, "compiles a regex inside a loop", r"\bre\.compile\s*\(", "loop", None),
+    (2, "loop with no exit condition", r"\bwhile\s+(True|1)\s*:", "anywhere", None),
     (2, "builds a string by repeated concatenation", r"\b\w+\s*\+=\s*(f?[\"']|str\s*\()|\b(\w+)\s*=\s*\2\s*\+\s*(f?[\"']|str\s*\()", "loop", None),
-    (3, "scans or sorts a whole collection inside a loop (may be O(n^2))", r"\.(index|count|remove)\s*\(|\.insert\s*\(\s*0\s*,|\b(sorted|sum|max|min)\s*\(", "loop", None),
-    (2, "copies data inside a loop", r"\bcopy\.deepcopy\s*\(|\blist\s*\(|\bdict\s*\(|\.copy\s*\(", "loop", None),
-    (2, "parses or formats JSON inside a loop", r"\bjson\.(loads|dumps)\s*\(", "loop", None),
-    (1, "indexes a sequence instead of iterating it", r"\bfor\s+\w+\s+in\s+range\s*\(\s*len\s*\(", "anywhere", None),
+    (3, "scans or sorts a whole collection inside a loop (may be O(n^2))", r"\.(index|count|remove)\s*\(|\.insert\s*\(\s*0\s*,|\bsorted\s*\(", "loop", None),
 ]
-# Points added when a loop sits inside another loop (the work grows with the product of both sizes), and the extra point when it sits three or more deep
-RISK_POINTS_NESTED_LOOP = 2
-RISK_POINTS_DEEP_LOOP = 1
 # Points added when a function is called from inside a loop somewhere else (its cost is multiplied by the number of iterations)
 RISK_POINTS_HOT_CALLEE = 2
 # A function name is only trusted to find its callers if at most this many chunks share it and it has at least this many characters (so that 'get' or 'at' do not link everything)
@@ -255,12 +240,6 @@ def find_performance_hints(chunk: CodeChunk) -> list[ReviewHint]:
                 continue
             if re.search(pattern, line):
                 hints.append(ReviewHint(chunk.start_line + index, shorten_for_hint(source_lines[index]), description, points))
-    # a loop inside a loop: the work grows with the product of the two sizes
-    for index in range(len(code_lines)):
-        if starts_loop[index] and depths[index] >= 1:
-            points = RISK_POINTS_NESTED_LOOP + (RISK_POINTS_DEEP_LOOP if depths[index] >= 2 else 0)
-            description = "loop nested inside another loop (the work grows with both sizes)"
-            hints.append(ReviewHint(chunk.start_line + index, shorten_for_hint(source_lines[index]), description, points))
     return hints
 
 # Find the functions that are called from inside a loop in another function.
